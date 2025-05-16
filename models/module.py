@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-#
 
 import math
+from concurrent.futures import ThreadPoolExecutor
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -128,6 +130,24 @@ class ModelManager(nn.Module):
         self.__num_intent = num_intent
         self.__args = args
 
+        # Initialize ISDACProcessor with parameters from args
+        isdac_tau = getattr(args, 'isdac_tau', 0.01)
+        isdac_min_len = getattr(args, 'isdac_min_len', 2)
+        isdac_max_len = getattr(args, 'isdac_max_len', 10)
+        # For avg_log_conf_threshold, it could be a single value or a list.
+        # ISDACProcessor's __init__ handles parsing this.
+        isdac_avg_log_conf_threshold = getattr(args, 'isdac_avg_log_conf_threshold', math.log(0.6))
+        isdac_overlap_iou = getattr(args, 'isdac_overlap_threshold_iou', 0.3)
+
+        self.isdac_processor = ISDACProcessor(
+            num_intent_labels=num_intent,  # Use the passed num_intent
+            tau=isdac_tau,
+            min_len=isdac_min_len,
+            max_len=isdac_max_len,
+            avg_log_conf_threshold=isdac_avg_log_conf_threshold,
+            overlap_threshold_iou=isdac_overlap_iou
+        )
+
         # Initialize an embedding object.
         self.__embedding = nn.Embedding(
             self.__num_word,
@@ -227,18 +247,64 @@ class ModelManager(nn.Module):
         intent_lstm_out = self.__intent_lstm(g_hiddens, seq_lens)
         intent_lstm_out = F.dropout(intent_lstm_out, p=self.__args.dropout_rate, training=self.training)
         pred_intent = self.__intent_decoder(intent_lstm_out)
-        seq_lens_tensor = torch.tensor(seq_lens)
-        if self.__args.gpu:
-            seq_lens_tensor = seq_lens_tensor.cuda()
-        intent_index_sum = torch.cat(
-            [
-                torch.sum(torch.sigmoid(pred_intent[i, 0:seq_lens[i], :]) > self.__args.threshold, dim=0).unsqueeze(0)
-                for i in range(len(seq_lens))
-            ],
-            dim=0
-        )
 
-        intent_index = (intent_index_sum > (seq_lens_tensor // 2).unsqueeze(1)).nonzero()
+        token_intent_log_probs = F.logsigmoid(pred_intent)
+
+        batch_size = pred_intent.shape[0]
+        all_batch_intents_tuples = []
+
+        # .detach() is important if pred_intent has requires_grad=True and ISDAC is non-differentiable
+        # and you don't want gradients flowing back from intent_index through ISDAC during training.
+        token_intent_log_probs_cpu = token_intent_log_probs.cpu().detach()
+
+        tasks_args = []
+        for i in range(batch_size):
+            current_seq_len = seq_lens[i]
+            log_probs_single = token_intent_log_probs_cpu[i, :current_seq_len, :]
+            tasks_args.append({
+                'log_probs': log_probs_single,
+                'seq_len': current_seq_len,
+            })
+
+        num_workers = getattr(self.__args, 'isdac_workers', 0)  # Default to 0 (sequential) if not specified
+
+        detected_intents_per_sample = [set() for _ in range(batch_size)]  # Initialize with empty sets
+
+        if batch_size > 0:
+            if num_workers > 0:
+                try:
+                    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                        results_iterator = executor.map(
+                            lambda p: self.isdac_processor.process_single_sentence(p['log_probs'], p['seq_len']),
+                            tasks_args
+                        )
+                        for i, detected_set in enumerate(results_iterator):
+                            detected_intents_per_sample[i] = detected_set
+                except Exception as e:  # Fallback in case of ThreadPoolExecutor issues
+                    print(f"ThreadPoolExecutor failed: {e}. Falling back to sequential processing.")
+                    for i in range(batch_size):
+                        detected_intents_per_sample[i] = self.isdac_processor.process_single_sentence(
+                            tasks_args[i]['log_probs'], tasks_args[i]['seq_len']
+                        )
+            else:  # Sequential processing if num_workers <= 0
+                for i in range(batch_size):
+                    detected_intents_per_sample[i] = self.isdac_processor.process_single_sentence(
+                        tasks_args[i]['log_probs'], tasks_args[i]['seq_len']
+                    )
+
+        for i, detected_set in enumerate(detected_intents_per_sample):
+            for intent_idx_val in detected_set:
+                all_batch_intents_tuples.append((i, intent_idx_val))
+
+        # Determine device for intent_index based on pred_intent's original device
+        # This ensures intent_index is on GPU if the model is on GPU.
+        output_device = pred_intent.device
+
+        if not all_batch_intents_tuples:
+            intent_index = torch.empty((0, 2), dtype=torch.long, device=output_device)
+        else:
+            intent_index = torch.tensor(all_batch_intents_tuples, dtype=torch.long, device=output_device)
+        # --- ISDAC VOTING END ---
 
         slot_lstm_out = self.__slot_lstm(torch.cat([g_hiddens, pred_intent], dim=-1), seq_lens)
         global_adj = self.generate_global_adj_gat(seq_lens, intent_index, len(pred_intent),
@@ -251,21 +317,35 @@ class ModelManager(nn.Module):
             intent_embedding=self.__intent_embedding
         )
         if n_predicts is None:
-            return F.log_softmax(pred_slot, dim=1), pred_intent
+            # Return log_softmax for slots, and raw logits for intent (as it was before)
+            # pred_intent here are the raw logits from __intent_decoder
+            return F.log_softmax(pred_slot, dim=-1), pred_intent  # Corrected dim to -1 for slots
         else:
-            _, slot_index = pred_slot.topk(n_predicts, dim=1)
+            # For top-k predictions
+            # pred_slot are logits
+            _, slot_indices_tensor = torch.topk(pred_slot, n_predicts, dim=-1)  # Corrected dim to -1 for slots
 
-            intent_index_sum = torch.cat(
-                [
-                    torch.sum(torch.sigmoid(pred_intent[i, 0:seq_lens[i], :]) > self.__args.threshold, dim=0).unsqueeze(
-                        0)
-                    for i in range(len(seq_lens))
-                ],
-                dim=0
-            )
-            intent_index = (intent_index_sum > (seq_lens_tensor // 2).unsqueeze(1)).nonzero()
+            # THE OLD INTENT VOTING CODE BELOW IS REMOVED:
+            # intent_index_sum = torch.cat(
+            #     [
+            #         torch.sum(torch.sigmoid(pred_intent[i, 0:seq_lens[i], :]) > self.__args.threshold, dim=0).unsqueeze(
+            #             0)
+            #         for i in range(len(seq_lens))
+            #     ],
+            #     dim=0
+            # )
+            # # seq_lens_tensor needs to be defined if this old code were to be kept
+            # # seq_lens_tensor = torch.tensor(seq_lens, device=pred_intent.device)
+            # intent_index = (intent_index_sum > (seq_lens_tensor // 2).unsqueeze(1)).nonzero()
 
-            return slot_index.cpu().data.numpy().tolist(), intent_index.cpu().data.numpy().tolist()
+            # We ALREADY have `intent_index` computed by ISDAC earlier in the forward pass.
+            # We just need to return it in the specified format.
+
+            # The `intent_index` from ISDAC is already an (N, 2) tensor where N is the
+            # total number of (batch_idx, intent_idx) pairs detected across the batch.
+            # The original code returns intent_index.cpu().data.numpy().tolist()
+
+            return slot_indices_tensor.cpu().data.numpy().tolist(), intent_index.cpu().data.numpy().tolist()
 
 
 class LSTMEncoder(nn.Module):
@@ -492,3 +572,172 @@ class UnflatSelfAttention(nn.Module):
         scores = F.softmax(scores, dim=1)
         context = scores.unsqueeze(2).expand_as(inp).mul(inp).sum(1)
         return context
+
+
+class ISDACProcessor:
+    def __init__(self,
+                 num_intent_labels: int,
+                 tau: float = 0.01,
+                 min_len: int = 2,
+                 max_len: int = 10,
+                 # avg_log_conf_threshold can be:
+                 # 1. A single float: same threshold for all intents
+                 # 2. A list/tuple of floats: specific threshold for each intent (length must be num_intent_labels)
+                 avg_log_conf_threshold: any = math.log(0.6),  # Example: log(0.6) ~ -0.51
+                 overlap_threshold_iou: float = 0.3):
+        """
+        Initializes the ISDAC Processor.
+
+        Args:
+            num_intent_labels (int): The total number of intent classes.
+            tau (float): Minimum confidence for a token (used in log(max(conf, tau))).
+            min_len (int): Minimum length of a potential intent segment.
+            max_len (int): Maximum length of a potential intent segment.
+            avg_log_conf_threshold (any): Threshold for average log confidence.
+                                          Can be a single float or a list/tuple of floats.
+            overlap_threshold_iou (float): IoU threshold for Non-Maximum Suppression.
+        """
+        self.num_intent_labels = num_intent_labels
+        self.tau = tau
+        self.min_len = min_len
+        self.max_len = max_len
+
+        if isinstance(avg_log_conf_threshold, (float, int)):
+            # If single value, replicate for all intents
+            self.avg_log_conf_thresholds_list = [float(avg_log_conf_threshold)] * num_intent_labels
+        elif isinstance(avg_log_conf_threshold, (list, tuple)):
+            if len(avg_log_conf_threshold) != num_intent_labels:
+                raise ValueError(f"Length of avg_log_conf_threshold list ({len(avg_log_conf_threshold)}) "
+                                 f"must match num_intent_labels ({num_intent_labels}).")
+            self.avg_log_conf_thresholds_list = [float(t) for t in avg_log_conf_threshold]
+        else:
+            raise TypeError("avg_log_conf_threshold must be a float, int, list, or tuple.")
+
+        self.overlap_threshold_iou = overlap_threshold_iou
+
+    def _get_threshold_for_intent(self, intent_idx: int) -> float:
+        """Returns the average log confidence threshold for a specific intent."""
+        if 0 <= intent_idx < self.num_intent_labels:
+            return self.avg_log_conf_thresholds_list[intent_idx]
+        else:
+            # This should ideally not happen if intent_idx is always valid
+            raise IndexError(f"Invalid intent_idx {intent_idx} for num_intent_labels {self.num_intent_labels}")
+
+    def _calculate_iou(self, seg1_start: int, seg1_end: int, seg2_start: int, seg2_end: int) -> float:
+        """Calculates Intersection over Union (IoU) between two segments."""
+        intersect_start = max(seg1_start, seg2_start)
+        intersect_end = min(seg1_end, seg2_end)
+
+        intersect_len = max(0, intersect_end - intersect_start + 1)
+        if intersect_len == 0:
+            return 0.0
+
+        len1 = seg1_end - seg1_start + 1
+        len2 = seg2_end - seg2_start + 1
+        union_len = len1 + len2 - intersect_len
+
+        if union_len == 0:  # Should not happen if segments have positive length and intersect_len > 0
+            return 0.0 if intersect_len == 0 else 1.0  # Or handle as an error
+
+        return intersect_len / union_len
+
+    def process_single_sentence(self,
+                                token_intent_log_probs_single: torch.Tensor,  # Shape: (seq_len, num_intent_labels)
+                                seq_len_single: int
+                                ) -> set[int]:
+        """
+        Applies ISDAC to a single sentence's token-intent log probabilities.
+
+        Args:
+            token_intent_log_probs_single (torch.Tensor):
+                Tensor of shape (actual_seq_len, num_intent_labels) containing
+                log(max(probability, tau)) for each token and intent.
+                Expected to be on CPU.
+            seq_len_single (int): The actual length of the sentence.
+
+        Returns:
+            set[int]: A set of detected intent indices for this sentence.
+        """
+        if token_intent_log_probs_single.shape[0] != seq_len_single:
+            raise ValueError(
+                f"Shape mismatch: token_intent_log_probs_single.shape[0] ({token_intent_log_probs_single.shape[0]}) "
+                f"!= seq_len_single ({seq_len_single})")
+        if token_intent_log_probs_single.shape[1] != self.num_intent_labels:
+            raise ValueError(
+                f"Shape mismatch: token_intent_log_probs_single.shape[1] ({token_intent_log_probs_single.shape[1]}) "
+                f"!= self.num_intent_labels ({self.num_intent_labels})")
+
+        candidate_segments = []  # Stores (start_idx, end_idx, intent_idx, avg_log_conf_score)
+
+        # 1. Generate candidate segments
+        for k in range(self.num_intent_labels):  # Iterate through each intent
+            intent_threshold = self._get_threshold_for_intent(k)
+
+            for t in range(seq_len_single):  # Potential end token index
+                # Determine valid start token indices 's' for segment [s, t]
+                # s = t - current_segment_len + 1
+                # min_len <= current_segment_len <= max_len
+                # min_len <= t - s + 1 <= max_len
+                # t - max_len + 1 <= s <= t - min_len + 1
+
+                s_loop_min = max(0, t - self.max_len + 1)
+                s_loop_max = t - self.min_len + 1  # s_loop_max is inclusive for range start
+
+                for s in range(s_loop_min, s_loop_max + 1):
+                    if s > t:  # This check ensures s is valid if max_len < min_len or t is small
+                        continue  # e.g. if t=0, min_len=2 -> s_loop_max = -1, loop won't run
+
+                    current_segment_len = t - s + 1
+                    # Already implicitly handled by loop bounds for s based on min_len, max_len
+                    # if not (self.min_len <= current_segment_len <= self.max_len):
+                    #    continue
+
+                    # Calculate sum_log_conf for segment [s, t] for intent k
+                    sum_log_conf = 0.0
+                    # Slicing and sum is fine for CPU tensors if not overly frequent
+                    # segment_data = token_intent_log_probs_single[s : t + 1, k]
+                    # sum_log_conf = torch.sum(segment_data).item()
+                    # Using explicit loop for clarity and if tensor is just a list of lists for example
+                    for token_idx_in_segment in range(s, t + 1):
+                        sum_log_conf += token_intent_log_probs_single[token_idx_in_segment, k].item()
+
+                    avg_log_conf = sum_log_conf / current_segment_len
+
+                    if avg_log_conf >= intent_threshold:
+                        candidate_segments.append((s, t, k, avg_log_conf))
+
+        # 2. Filter candidates: one "best" intent per (s,t) physical segment (Optional but recommended)
+        if candidate_segments:
+            filtered_candidates_map = {}  # key: (s,t) tuple, value: (s, t, intent_idx, score) tuple
+            for s_val, t_val, k_val, score_val in candidate_segments:
+                segment_key = (s_val, t_val)
+                if segment_key not in filtered_candidates_map or score_val > filtered_candidates_map[segment_key][3]:
+                    filtered_candidates_map[segment_key] = (s_val, t_val, k_val, score_val)
+
+            candidate_segments = list(filtered_candidates_map.values())
+
+        # 3. Greedy NMS-like selection
+        final_detected_intents_for_sentence = set()
+        if not candidate_segments:
+            return final_detected_intents_for_sentence
+
+        # Sort candidates by score in descending order
+        candidate_segments.sort(key=lambda x: x[3], reverse=True)
+
+        # This list stores chosen segments (s,t) to check for overlaps.
+        # We could also directly modify candidate_segments list but it's cleaner this way.
+        selected_segments_for_nms = []
+
+        for cand_s, cand_t, cand_k, cand_score in candidate_segments:
+            is_overlapping = False
+            for sel_s, sel_t, _, _ in selected_segments_for_nms:
+                iou = self._calculate_iou(cand_s, cand_t, sel_s, sel_t)
+                if iou > self.overlap_threshold_iou:
+                    is_overlapping = True
+                    break
+
+            if not is_overlapping:
+                selected_segments_for_nms.append((cand_s, cand_t, cand_k, cand_score))
+                final_detected_intents_for_sentence.add(cand_k)  # Add intent_idx
+
+        return final_detected_intents_for_sentence

@@ -5,7 +5,7 @@
  "log_dir": "./log/MixSNIPS",
  "log_name": "log.txt",
  "random_state": 72,
- "gpu": true,
+ "gpu": false,
  "num_epoch": 0,
  "batch_size": 16,
  "l2_penalty": 1e-06,
