@@ -142,7 +142,7 @@ class ModelManager(nn.Module):
         # 这里用 sqrt(d_model) 作为示例
         d_ff = d_model * 4  # FFN中间层维度, Transformer常见设置为4*d_model (论文未明确, 这是常见做法)
         num_layers = 4  # Encoder层数 (论文Table1后 Ne=4)
-        max_seq_len = 64  # 假设的最大序列长度
+        max_seq_len = 128  # 假设的最大序列长度
         dropout_rate = 0.1  # Dropout比例 (论文Table1后 dropout_ratio=0.1)
         padding_idx = 0  # Padding token的ID
 

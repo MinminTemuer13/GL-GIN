@@ -271,36 +271,30 @@ class HAEncoder(nn.Module):
         yS_prelim = None
         yI_prelim = None
 
-        # Pooling(h) - Average pooling over sequence dimension
-        # 要注意padding的影响，只对非padding部分进行平均
-        # h: [batch, seq_len, d_model], src_padding_mask: [batch, seq_len]
-        masked_h = h * src_padding_mask.unsqueeze(-1).float() # 将padding位置的h置为0
-        sum_h = torch.sum(masked_h, dim=1) # [batch, d_model]
-        num_non_padding = src_padding_mask.sum(dim=1, keepdim=True).float() # [batch, 1]
-        num_non_padding = torch.clamp(num_non_padding, min=1.0) # 防止除以0
-        pooled_h_sentence = sum_h / num_non_padding # [batch, d_model]
+        if self.ds > 0 or self.di > 0:  # 只有当需要预测槽位或意图时才执行
+            # Pooling(h) - Average pooling over sequence dimension
+            # 要注意padding的影响，只对非padding部分进行平均
+            # h: [batch, seq_len, d_model], src_padding_mask: [batch, seq_len]
+            masked_h = h * src_padding_mask.unsqueeze(-1).float() # 将padding位置的h置为0
+            sum_h = torch.sum(masked_h, dim=1) # [batch, d_model]
+            num_non_padding = src_padding_mask.sum(dim=1, keepdim=True).float() # [batch, 1]
+            num_non_padding = torch.clamp(num_non_padding, min=1.0) # 防止除以0
+            pooled_h_sentence = sum_h / num_non_padding  # [batch, d_model]
 
-        # 组合 h_j 和 Pooled_h_sentence
-        # h_j: [batch, d_model] (在循环中取)
-        # pooled_h_sentence: [batch, d_model]
-        if self.ds > 0:
-            ys_list = []
-            for j in range(h.size(1)): # 遍历序列中的每个token
-                h_j = h[:, j, :] # [batch, d_model]
-                combined_features_for_slot = torch.cat((h_j, pooled_h_sentence), dim=-1) # [batch, d_model * 2]
-                ys_j = self.Ws_linear(combined_features_for_slot) # [batch, ds]
-                ys_list.append(ys_j.unsqueeze(1))
-            yS_prelim = torch.cat(ys_list, dim=1) # [batch, seq_len, ds]
+            # 扩展 pooled_h_sentence 以便与 h 拼接
+            # h: [batch, seq_len, d_model]
+            # 组合 h_j 和 Pooled_h_sentence
+            # h_j: [batch, d_model] (在循环中取)
+            # pooled_h_sentence: [batch, d_model]
+            seq_len = h.size(1)
+            pooled_h_expanded = pooled_h_sentence.unsqueeze(1).expand(-1, seq_len, -1)  # [batch, seq_len, d_model]
 
-        if self.di > 0:
-            yi_list = []
-            for j in range(h.size(1)): # 理论上意图预测只需要一次，但论文公式是对每个hj都预测
-                h_j = h[:, j, :]
-                combined_features_for_intent = torch.cat((h_j, pooled_h_sentence), dim=-1)
-                yi_j = self.Wi_linear(combined_features_for_intent)
-                yi_list.append(yi_j.unsqueeze(1))
-            yI_prelim = torch.cat(yi_list, dim=1) # [batch, seq_len, di]
+            combined_features = torch.cat((h, pooled_h_expanded), dim=-1)  # [batch, seq_len, d_model * 2]
 
+            if self.ds > 0:
+                yS_prelim = self.Ws_linear(combined_features)  # [batch, seq_len, ds]
+            if self.di > 0:
+                yI_prelim = self.Wi_linear(combined_features)  # [batch, seq_len, di]
 
         return {
             "encoder_output": h, # [batch_size, seq_len, d_model]
