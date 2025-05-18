@@ -237,10 +237,11 @@ class HAEncoder(nn.Module):
         # WS ∈ R^{d_s × 2d_model}, WI ∈ R^{d_i × 2d_model}
         self.ds = num_slot_labels
         self.di = num_intent_labels
-        if self.ds > 0 : # 只有在需要槽位预测时才定义
-            self.Ws_linear = nn.Linear(d_model * 2, self.ds)
+
         if self.di > 0: # 只有在需要意图预测时才定义
             self.Wi_linear = nn.Linear(d_model * 2, self.di)
+        if self.ds > 0 : # 只有在需要槽位预测时才定义
+            self.Ws_linear = nn.Linear(d_model * 2, self.ds)
 
 
     def forward(self, src_tokens):
@@ -296,13 +297,15 @@ class HAEncoder(nn.Module):
             if self.di > 0:
                 yI_prelim = self.Wi_linear(combined_features)  # [batch, seq_len, di]
 
-        return {
-            "encoder_output": h, # [batch_size, seq_len, d_model]
-            "prelim_slot_predictions": yS_prelim, # [batch_size, seq_len, num_slot_labels] or None
-            "prelim_intent_predictions": yI_prelim, # [batch_size, seq_len, num_intent_labels] or None
-            "final_affinity_scores_a": current_affinity_scores_a, # [batch_size, seq_len-1] or None
-            "all_layer_attention_weights": all_layer_attention_weights # list of [batch, n_heads, seq_len, seq_len]
-        }
+        return h, yI_prelim, yS_prelim, current_affinity_scores_a, all_layer_attention_weights
+
+    # {
+    #     "encoder_output": h,  # [batch_size, seq_len, d_model]
+    #     "prelim_slot_predictions": yS_prelim,  # [batch_size, seq_len, num_slot_labels] or None
+    #     "prelim_intent_predictions": yI_prelim,  # [batch_size, seq_len, num_intent_labels] or None
+    #     "final_affinity_scores_a": current_affinity_scores_a,  # [batch_size, seq_len-1] or None
+    #     "all_layer_attention_weights": all_layer_attention_weights  # list of [batch, n_heads, seq_len, seq_len]
+    # }
 
 # --- 示例用法 ---
 if __name__ == '__main__':

@@ -130,12 +130,12 @@ class ModelManager(nn.Module):
         self.__num_intent = num_intent
         self.__args = args
 
-        self.__embedding = nn.Embedding(
-            self.__num_word,
-            self.__args.word_embedding_dim
-        )
+        # self.__embedding = nn.Embedding(
+        #     self.__num_word,
+        #     self.__args.word_embedding_dim
+        # )
 
-        d_model = 128 + 256  # Transformer 输入输出维度 (论文Table1后 Ne=4, d_model=128)
+        d_model = 256  # Transformer 输入输出维度 (论文Table1后 Ne=4, d_model=128)
         n_heads = 8  # 注意力头数 (论文Table1后 num_attention_heads=8)
         d_k_neighbor = math.sqrt(d_model)  # 公式(3)中的 d_s, 论文未明确, 合理假设为sqrt(d_model)或d_model/n_heads
         # 或者一个固定的超参数, 例如论文引用[Wang et al. 2019]可能提到
@@ -154,19 +154,18 @@ class ModelManager(nn.Module):
             d_ff=d_ff,
             input_vocab_size=self.__num_word,
             max_len=max_seq_len,
-            num_slot_labels=self.__num_slot,
+            num_slot_labels=0,
             num_intent_labels=self.__num_intent,
             dropout=dropout_rate,
             padding_idx=padding_idx
         )
 
-        self.G_encoder = Encoder(args)
+        # self.G_encoder = Encoder(args)
         # Initialize an Decoder object for intent.
         self.__intent_decoder = nn.Sequential(
-            nn.Linear(self.__args.encoder_hidden_dim + self.__args.attention_output_dim,
-                      self.__args.encoder_hidden_dim + self.__args.attention_output_dim),
+            nn.Linear(self.__args.encoder_hidden_dim, self.__args.encoder_hidden_dim ),
             nn.LeakyReLU(args.alpha),
-            nn.Linear(self.__args.encoder_hidden_dim + self.__args.attention_output_dim, self.__num_intent),
+            nn.Linear(self.__args.encoder_hidden_dim, self.__num_intent),
         )
 
         self.__intent_embedding = nn.Parameter(
@@ -174,7 +173,7 @@ class ModelManager(nn.Module):
         nn.init.normal_(self.__intent_embedding.data)
 
         self.__slot_lstm = LSTMEncoder(
-            self.__args.encoder_hidden_dim + self.__args.attention_output_dim + num_intent,
+            self.__args.encoder_hidden_dim + num_intent,
             self.__args.slot_decoder_hidden_dim,
             self.__args.dropout_rate
         )
@@ -250,16 +249,14 @@ class ModelManager(nn.Module):
 
     def forward(self, text_token_ids, seq_lens, n_predicts=None):
         ha_encoder_outputs = self.__HA_encoder(text_token_ids)
-        g_hiddens = ha_encoder_outputs["encoder_output"]
-        # intent_lstm_out = ha_encoder_outputs["prelim_intent_predictions"]
-        # slot_lstm_out = ha_encoder_outputs["prelim_slot_predictions"]
+        g_hiddens, pred_intent, *_ = ha_encoder_outputs
 
     # def forward(self, text, seq_lens, n_predicts=None):
     #     word_tensor = self.__embedding(text)
     #     g_hiddens = self.G_encoder(word_tensor, seq_lens)
-        intent_lstm_out = self.__intent_lstm(g_hiddens, seq_lens)
-        intent_lstm_out = F.dropout(intent_lstm_out, p=self.__args.dropout_rate, training=self.training)
-        pred_intent = self.__intent_decoder(intent_lstm_out)
+    #     intent_lstm_out = self.__intent_lstm(g_hiddens, seq_lens)
+    #     intent_lstm_out = F.dropout(intent_lstm_out, p=self.__args.dropout_rate, training=self.training)
+    #     pred_intent = self.__intent_decoder(intent_lstm_out)
         seq_lens_tensor = torch.tensor(seq_lens)
         if self.__args.gpu:
             seq_lens_tensor = seq_lens_tensor.cuda()
@@ -278,7 +275,8 @@ class ModelManager(nn.Module):
                                                   self.__args.slot_graph_window)
         slot_adj = self.generate_slot_adj_gat(seq_lens, len(pred_intent), self.__args.slot_graph_window)
         pred_slot = self.__slot_decoder(
-            slot_lstm_out, seq_lens,
+            slot_lstm_out,
+            seq_lens,
             global_adj=global_adj,
             slot_adj=slot_adj,
             intent_embedding=self.__intent_embedding
