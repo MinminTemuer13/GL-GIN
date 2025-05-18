@@ -154,9 +154,10 @@ class Processor(object):
             fitlog.add_loss(total_intent_loss, name='intent loss', step=epoch)
             fitlog.add_loss(total_intent_loss + total_slot_loss, name='total loss', step=epoch)
             time_con = time.time() - time_start
-            print(
-                '[Epoch {:2d}]: The total slot loss on train data is {:2.6f}, intent data is {:2.6f}, cost ' \
-                'about {:2.6} seconds.'.format(epoch, total_slot_loss, total_intent_loss, time_con))
+            with tqdm.get_lock():
+                tqdm.write(
+                    '[Epoch {:2d}]: The total slot loss on train data is {:2.6f}, intent data is {:2.6f}, cost ' \
+                    'about {:2.6} seconds.'.format(epoch, total_slot_loss, total_intent_loss, time_con))
 
             change, time_start = False, time.time()
             dev_slot_f1_score, dev_intent_f1_score, dev_intent_acc_score, dev_sent_acc_score = self.estimate(
@@ -181,9 +182,10 @@ class Processor(object):
                 test_slot_f1, test_intent_f1, test_intent_acc, test_sent_acc = self.estimate(
                     if_dev=False, test_batch=self.__batch_size, args=self.args)
 
-                print('\nTest result: epoch: {}, slot f1 score: {:.6f}, intent f1 score: {:.6f}, intent acc score:'
-                      ' {:.6f}, semantic accuracy score: {:.6f}.'.
-                      format(epoch, test_slot_f1, test_intent_f1, test_intent_acc, test_sent_acc))
+                with tqdm.get_lock():
+                    tqdm.write('\nTest result: epoch: {}, slot f1 score: {:.6f}, intent f1 score: {:.6f}, intent acc score:'
+                          ' {:.6f}, semantic accuracy score: {:.6f}.'.
+                          format(epoch, test_slot_f1, test_intent_f1, test_intent_acc, test_sent_acc))
 
                 model_save_dir = os.path.join(self.__dataset.save_dir, "model")
                 if not os.path.exists(model_save_dir):
@@ -221,10 +223,11 @@ class Processor(object):
                 torch.save(self.__dataset, os.path.join(model_save_dir, 'dataset.pkl'))
 
                 time_con = time.time() - time_start
-                print('[Epoch {:2d}]: In validation process, the slot f1 score is {:2.6f}, ' \
-                      'the intent f1 score is {:2.6f}, the intent acc score is {:2.6f}, the semantic acc is {:.2f}, cost about {:2.6f} seconds.\n'.format(
-                    epoch, dev_slot_f1_score, dev_intent_f1_score, dev_intent_acc_score,
-                    dev_sent_acc_score, time_con))
+                with tqdm.get_lock():
+                    tqdm.write('[Epoch {:2d}]: In validation process, the slot f1 score is {:2.6f}, ' \
+                          'the intent f1 score is {:2.6f}, the intent acc score is {:2.6f}, the semantic acc is {:.2f}, cost about {:2.6f} seconds.\n'.format(
+                        epoch, dev_slot_f1_score, dev_intent_f1_score, dev_intent_acc_score,
+                        dev_sent_acc_score, time_con))
 
             else:
                 no_improve += 1
@@ -254,11 +257,12 @@ class Processor(object):
         intent_f1_score = f1_score(
             instance2onehot(self.__dataset.intent_alphabet.get_index, num_intent, real_intent),
             instance2onehot(self.__dataset.intent_alphabet.get_index, num_intent, pred_intent),
-            average='macro')
+            average='macro', zero_division=0)
         intent_acc_score = Evaluator.intent_acc(pred_intent, real_intent)
         sent_acc = Evaluator.semantic_acc(pred_slot, real_slot, pred_intent, real_intent)
-        print("slot f1: {}, intent f1: {}, intent acc: {}, exact acc: {}".format(slot_f1_score, intent_f1_score,
-                                                                                 intent_acc_score, sent_acc))
+        with tqdm.get_lock():
+            tqdm.write("slot f1: {}, intent f1: {}, intent acc: {}, exact acc: {}".format(slot_f1_score, intent_f1_score,
+                                                                                     intent_acc_score, sent_acc))
         # Write those sample both have intent and slot errors.
         with open(os.path.join(args.save_dir, 'error.txt'), 'w', encoding="utf8") as fw:
             for p_slot_list, r_slot_list, p_intent_list, r_intent in \
@@ -292,11 +296,12 @@ class Processor(object):
         slot_f1_score = miulab.computeF1Score(ss, real_slot, pred_slot, args)[0]
         intent_f1_score = f1_score(instance2onehot(dataset.intent_alphabet.get_index, num_intent, real_intent),
                                    instance2onehot(dataset.intent_alphabet.get_index, num_intent, pred_intent),
-                                   average='macro')
+                                   average='macro', zero_division=0)
         intent_acc_score = Evaluator.intent_acc(pred_intent, real_intent)
         sent_acc = Evaluator.semantic_acc(pred_slot, real_slot, pred_intent, real_intent)
-        print("slot f1: {}, intent f1: {}, intent acc: {}, exact acc: {}".format(slot_f1_score, intent_f1_score,
-                                                                                 intent_acc_score, sent_acc))
+        with tqdm.get_lock():
+            tqdm.write("slot f1: {}, intent f1: {}, intent acc: {}, exact acc: {}".format(slot_f1_score, intent_f1_score,
+                                                                                     intent_acc_score, sent_acc))
         # Write those sample both have intent and slot errors.
 
         with open(os.path.join(args.save_dir, 'error.txt'), 'w', encoding="utf8") as fw:

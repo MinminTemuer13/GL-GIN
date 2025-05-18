@@ -219,7 +219,7 @@ class HierarchicalAttentionEncoderLayer(nn.Module):
 
 class HAEncoder(nn.Module):
     def __init__(self, num_layers, d_model, n_heads, d_k_neighbor, d_ff,
-                 input_vocab_size, max_len, num_slot_labels, num_intent_labels, dropout=0.1, padding_idx=0):
+                 input_vocab_size, max_len, d_slot_labels, d_intent_labels, dropout=0.1, padding_idx=0):
         super().__init__()
         self.padding_idx = padding_idx
         self.token_embedding = nn.Embedding(input_vocab_size, d_model, padding_idx=self.padding_idx)
@@ -235,8 +235,8 @@ class HAEncoder(nn.Module):
         # h_j || Pooling(h)
         # Pooling(h) 是 average pooling
         # WS ∈ R^{d_s × 2d_model}, WI ∈ R^{d_i × 2d_model}
-        self.ds = num_slot_labels
-        self.di = num_intent_labels
+        self.ds = d_slot_labels
+        self.di = d_intent_labels
 
         if self.di > 0: # 只有在需要意图预测时才定义
             self.Wi_linear = nn.Linear(d_model * 2, self.di)
@@ -335,8 +335,8 @@ if __name__ == '__main__':
         d_ff=d_ff,
         input_vocab_size=vocab_size,
         max_len=max_seq_len,
-        num_slot_labels=num_slot_labels_example,
-        num_intent_labels=num_intent_labels_example,
+        d_slot_labels=num_slot_labels_example,
+        d_intent_labels=num_intent_labels_example,
         dropout=dropout_rate,
         padding_idx=padding_idx
     )
