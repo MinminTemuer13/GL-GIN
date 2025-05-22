@@ -9,7 +9,7 @@ from torch.nn.utils.rnn import pad_packed_sequence
 from torch.nn.parameter import Parameter
 import numpy as np
 
-from models.HAEncoder import HAEncoder
+from models.HDAEncoder import HierarchicalDiffEncoder
 from utils.process import normalize_adj
 
 
@@ -135,63 +135,57 @@ class ModelManager(nn.Module):
         #     self.__args.word_embedding_dim
         # )
 
-        d_model = 256  # Transformer 输入输出维度 (论文Table1后 Ne=4, d_model=128)
-        n_heads = 8  # 注意力头数 (论文Table1后 num_attention_heads=8)
+        num_enc_layers = 4  # Encoder层数 (论文Table1后 Ne=4)
+        d_model = 128  # Transformer 输入输出维度 (论文Table1后 Ne=4, d_model=128)
+        n_heads = 1  # 注意力头数 (论文Table1后 num_attention_heads=8)
         d_k_neighbor = math.sqrt(d_model)  # 公式(3)中的 d_s, 论文未明确, 合理假设为sqrt(d_model)或d_model/n_heads
-        # 或者一个固定的超参数, 例如论文引用[Wang et al. 2019]可能提到
-        # 这里用 sqrt(d_model) 作为示例
-        d_ff = d_model * 4  # FFN中间层维度, Transformer常见设置为4*d_model (论文未明确, 这是常见做法)
-        num_layers = 4  # Encoder层数 (论文Table1后 Ne=4)
-        max_seq_len = 128  # 假设的最大序列长度
+        d_ff = d_model * 2  # FFN中间层维度, Transformer常见设置为4*d_model (论文未明确, 这是常见做法)
+        max_seq_len = 80  # 假设的最大序列长度
         dropout_rate = 0.1  # Dropout比例 (论文Table1后 dropout_ratio=0.1)
         padding_idx = 0  # Padding token的ID
 
-        self.__HA_encoder = HAEncoder(
-            num_layers=num_layers,
+        self.__HDA_encoder = HierarchicalDiffEncoder(
+            num_encoder_layers=num_enc_layers,
             d_model=d_model,
             n_heads=n_heads,
-            d_k_neighbor=d_k_neighbor,
+            d_k_neighbor=int(d_k_neighbor),
             d_ff=d_ff,
             input_vocab_size=self.__num_word,
             max_len=max_seq_len,
-            d_slot_labels=self.__args.slot_decoder_hidden_dim,
-            d_intent_labels=self.__args.encoder_hidden_dim,
-            dropout=dropout_rate,
+            num_slot_labels=0,
+            num_intent_labels=self.__num_intent,
+            dropout_rate=dropout_rate,
             padding_idx=padding_idx
         )
 
         # self.G_encoder = Encoder(args)
         # Initialize an Decoder object for intent.
         self.__intent_decoder = nn.Sequential(
-            nn.Linear(self.__args.encoder_hidden_dim, self.__args.encoder_hidden_dim),
+            nn.Linear(self.__args.encoder_hidden_dim, self.__args.encoder_hidden_dim ),
             nn.LeakyReLU(args.alpha),
             nn.Linear(self.__args.encoder_hidden_dim, self.__num_intent),
         )
 
         self.__intent_embedding = nn.Parameter(
-            torch.FloatTensor(self.__num_intent, self.__args.intent_embedding_dim)
-        )  # 191, 32
+            torch.FloatTensor(self.__num_intent, self.__args.intent_embedding_dim))  # 191, 32
         nn.init.normal_(self.__intent_embedding.data)
 
-        # self.__slot_lstm = LSTMEncoder(
-        #     self.__args.encoder_hidden_dim + num_intent, # 256 + n_i
-        #     self.__args.slot_decoder_hidden_dim, # 64
-        #     self.__args.dropout_rate
-        # )
-        #
-        # self.__intent_lstm = LSTMEncoder(
-        #     self.__args.encoder_hidden_dim,
-        #     self.__args.encoder_hidden_dim,
-        #     self.__args.dropout_rate
-        # )
+        self.__slot_lstm = LSTMEncoder(
+            self.__args.encoder_hidden_dim + num_intent,
+            self.__args.slot_decoder_hidden_dim,
+            self.__args.dropout_rate
+        )
+        self.__intent_lstm = LSTMEncoder(
+            self.__args.encoder_hidden_dim + self.__args.attention_output_dim,
+            self.__args.encoder_hidden_dim + self.__args.attention_output_dim,
+            self.__args.dropout_rate
+        )
 
         self.__slot_decoder = LSTMDecoder(
             args,
-            128,
+            self.__args.encoder_hidden_dim + self.__args.attention_output_dim,
             self.__args.slot_decoder_hidden_dim,
-            self.__num_slot,
-            self.__args.dropout_rate
-        )
+            self.__num_slot, self.__args.dropout_rate)
 
     def show_summary(self):
         """
@@ -252,17 +246,13 @@ class ModelManager(nn.Module):
         return adj
 
     def forward(self, text_token_ids, seq_lens, n_predicts=None):
-        ha_encoder_outputs = self.__HA_encoder(text_token_ids)
-        g_hiddens, intent_lstm_out, slot_lstm_out, *_ = ha_encoder_outputs
-    #     256, 256, 128
+        hda_encoder_outputs = self.__HDA_encoder(text_token_ids)
+        g_hiddens = hda_encoder_outputs["encoder_output"]
+        pred_intent = hda_encoder_outputs["prelim_intent_predictions"]
 
-    # def forward(self, text, seq_lens, n_predicts=None):
-    #     word_tensor = self.__embedding(text)
-    #     g_hiddens = self.G_encoder(word_tensor, seq_lens)
     #     intent_lstm_out = self.__intent_lstm(g_hiddens, seq_lens)
     #     intent_lstm_out = F.dropout(intent_lstm_out, p=self.__args.dropout_rate, training=self.training)
-        pred_intent = self.__intent_decoder(intent_lstm_out)
-
+    #     pred_intent = self.__intent_decoder(intent_lstm_out)
         seq_lens_tensor = torch.tensor(seq_lens)
         if self.__args.gpu:
             seq_lens_tensor = seq_lens_tensor.cuda()
@@ -276,8 +266,9 @@ class ModelManager(nn.Module):
 
         intent_index = (intent_index_sum > (seq_lens_tensor // 2).unsqueeze(1)).nonzero()
 
-        # slot_lstm_out = self.__slot_lstm(torch.cat([g_hiddens, pred_intent], dim=-1), seq_lens)
-        global_adj = self.generate_global_adj_gat(seq_lens, intent_index, len(pred_intent), self.__args.slot_graph_window)
+        slot_lstm_out = self.__slot_lstm(torch.cat([g_hiddens, pred_intent], dim=-1), seq_lens)
+        global_adj = self.generate_global_adj_gat(seq_lens, intent_index, len(pred_intent),
+                                                  self.__args.slot_graph_window)
         slot_adj = self.generate_slot_adj_gat(seq_lens, len(pred_intent), self.__args.slot_graph_window)
         pred_slot = self.__slot_decoder(
             slot_lstm_out,
@@ -314,7 +305,7 @@ class LSTMEncoder(nn.Module):
 
         # Parameter recording.
         self.__embedding_dim = embedding_dim
-        self.__hidden_dim = hidden_dim
+        self.__hidden_dim = hidden_dim // 2
         self.__dropout_rate = dropout_rate
 
         # Network attributes.
@@ -329,6 +320,10 @@ class LSTMEncoder(nn.Module):
         )
 
     def forward(self, embedded_text, seq_lens):
+        # print(embedded_text.size()) # torch.Size([16, 38, 256])
+        # torch.Size([16, 48, 384])
+        # torch.Size([16, 48, 402])
+
         """ Forward process for LSTM Encoder.
 
         (batch_size, max_sent_len)
@@ -367,10 +362,12 @@ class LSTMDecoder(nn.Module):
 
         super(LSTMDecoder, self).__init__()
         self.__args = args
+        self.__input_dim = input_dim
         self.__hidden_dim = hidden_dim
         self.__output_dim = output_dim
         self.__dropout_rate = dropout_rate
         self.__embedding_dim = embedding_dim
+        self.__extra_dim = extra_dim
 
         # If embedding_dim is not None, the output and input
         # of this structure is relevant.
@@ -412,6 +409,7 @@ class LSTMDecoder(nn.Module):
         :param seq_lens: is a list containing lengths of sentence.
         :return: is distribution of prediction labels.
         """
+
         input_tensor = encoded_hiddens
         output_tensor_list, sent_start_pos = [], 0
 
