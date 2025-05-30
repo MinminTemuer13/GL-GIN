@@ -9,7 +9,7 @@ from torch.nn.utils.rnn import pad_packed_sequence
 from torch.nn.parameter import Parameter
 import numpy as np
 
-from models.HDAEncoder import HierarchicalDiffEncoder
+from models.HDAEncoder import HierarchicalDiffEncoderWithRoPE
 from utils.process import normalize_adj
 
 
@@ -135,23 +135,23 @@ class ModelManager(nn.Module):
         #     self.__args.word_embedding_dim
         # )
 
-        num_enc_layers = 4  # Encoder层数 (论文Table1后 Ne=4)
+        num_enc_layers = 3  # Encoder层数 (论文Table1后 Ne=4)
         d_model = 128  # Transformer 输入输出维度 (论文Table1后 Ne=4, d_model=128)
-        n_heads = 1  # 注意力头数 (论文Table1后 num_attention_heads=8)
+        n_heads = 2  # 注意力头数
         d_k_neighbor = math.sqrt(d_model)  # 公式(3)中的 d_s, 论文未明确, 合理假设为sqrt(d_model)或d_model/n_heads
         d_ff = d_model * 2  # FFN中间层维度, Transformer常见设置为4*d_model (论文未明确, 这是常见做法)
         max_seq_len = 80  # 假设的最大序列长度
         dropout_rate = 0.1  # Dropout比例 (论文Table1后 dropout_ratio=0.1)
         padding_idx = 0  # Padding token的ID
 
-        self.__HDA_encoder = HierarchicalDiffEncoder(
+        self.__HDA_encoder = HierarchicalDiffEncoderWithRoPE(
             num_encoder_layers=num_enc_layers,
             d_model=d_model,
             n_heads=n_heads,
             d_k_neighbor=int(d_k_neighbor),
             d_ff=d_ff,
             input_vocab_size=self.__num_word,
-            max_len=max_seq_len,
+            max_seq_len=max_seq_len,
             num_slot_labels=0,
             num_intent_labels=self.__num_intent,
             dropout_rate=dropout_rate,
@@ -246,9 +246,15 @@ class ModelManager(nn.Module):
         return adj
 
     def forward(self, text_token_ids, seq_lens, n_predicts=None):
+        # 1. HDA Encoder
         hda_encoder_outputs = self.__HDA_encoder(text_token_ids)
+        # g_hiddens: (batch, seq_len, d_model) - token的上下文表示
         g_hiddens = hda_encoder_outputs["encoder_output"]
+        # pred_intent_logits_all: (batch, seq_len, num_total_intent) - token级初步意图logits
         pred_intent = hda_encoder_outputs["prelim_intent_predictions"]
+        affinity = hda_encoder_outputs["final_affinity_scores_a"]
+    #     todo 在这里设置一个 affinity_scores，真的有用吗？
+    #     todo 或者说，你给如何增大这一设计的作用
 
     #     intent_lstm_out = self.__intent_lstm(g_hiddens, seq_lens)
     #     intent_lstm_out = F.dropout(intent_lstm_out, p=self.__args.dropout_rate, training=self.training)
@@ -266,6 +272,32 @@ class ModelManager(nn.Module):
 
         intent_index = (intent_index_sum > (seq_lens_tensor // 2).unsqueeze(1)).nonzero()
 
+        # # 1. 对每个词元的意图 logits 应用 Softmax (在所有意图上，包括 "no_intent")
+        # token_intent_probs = F.softmax(pred_intent, dim=-1)
+        # # 2. 找出每个词元概率最高的意图 (argmax)
+        # token_dominant_intent_indices = torch.argmax(token_intent_probs, dim=-1)
+        # # 3. 创建一个掩码，用于在统计时忽略 padding 部分 和 "no_intent" 的主导情况
+        # sequence_mask = (torch.arange(pred_intent.size(1), device=pred_intent.device)[None, :] <
+        #                  torch.tensor(seq_lens, device=pred_intent.device)[:, None])
+        # # 其次，标记那些主导意图不是 "no_intent" 的 token
+        # is_meaningful_intent_token = (token_dominant_intent_indices != (self.__num_intent - 1))
+        # # 合并掩码：必须是有效token 且 主导意图不是 "no_intent"
+        # final_token_mask_for_counting = sequence_mask & is_meaningful_intent_token
+        # # 4. 高效统计每个句子中，各个真实意图作为“主要意图”出现的次数
+        # # 我们只关心前 num_intent - 1 个真实意图
+        # one_hot_dominant_meaningful_intents = F.one_hot(token_dominant_intent_indices,
+        #                                                     num_classes=self.__num_intent)[:, :, :-1]  # 取前num_intent-1个
+        # masked_one_hot = one_hot_dominant_meaningful_intents * final_token_mask_for_counting.unsqueeze(-1)
+        # intent_counts_meaningful = torch.sum(masked_one_hot, dim=1)  # 形状 (batch, num_intent - 1)
+        # seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.float32, device=pred_intent.device)
+        # min_token_ratio_for_intent = getattr(self.__args, 'min_token_ratio_for_intent', 1.0 / 4.0)
+        # threshold_counts_per_sentence = (seq_lens_tensor * min_token_ratio_for_intent).unsqueeze(1)
+        #
+        # is_sentence_intent = (intent_counts_meaningful.float() > threshold_counts_per_sentence)
+        # intent_index = is_sentence_intent.nonzero()  # 形状 (num_found_intents, 2)
+
+
+        # todo 然后就是 Interaction_module 这一块是必须要好好设计的模块
         slot_lstm_out = self.__slot_lstm(torch.cat([g_hiddens, pred_intent], dim=-1), seq_lens)
         global_adj = self.generate_global_adj_gat(seq_lens, intent_index, len(pred_intent),
                                                   self.__args.slot_graph_window)
@@ -292,6 +324,7 @@ class ModelManager(nn.Module):
             )
             intent_index = (intent_index_sum > (seq_lens_tensor // 2).unsqueeze(1)).nonzero()
 
+            # todo 最后就是解码器啦，解码器要为意图多设计一个 no_intent 门控机制
             return slot_index.cpu().data.numpy().tolist(), intent_index.cpu().data.numpy().tolist()
 
 

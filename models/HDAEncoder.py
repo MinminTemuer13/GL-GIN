@@ -36,56 +36,105 @@ class RMSNorm(nn.Module):
         return output * self.weight
 
 
-# --- 模块 1: 位置编码 (PositionalEncoding) ---
-class PositionalEncoding(nn.Module):
-    """标准的Transformer位置编码模块。
-
-    通过在词嵌入中加入位置信息，使得模型能够区分序列中不同位置的词。
+# --- 模块 1: 旋转位置编码 (RotaryEmbedding) ---
+class RotaryEmbedding(nn.Module):
     """
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+    旋转位置编码 (RoPE) 模块。
+    它通过旋转Query和Key向量的某些维度来注入相对位置信息。
+    """
+    def __init__(self, dim: int, max_seq_len: int, theta: float = 10000.0, base: int = 10000):
         """
-        初始化位置编码模块。
+        初始化RoPE。
 
         参数:
-            d_model (int): 模型的维度 (词嵌入的维度)。
-            dropout (float): Dropout的比率。
-            max_len (int): 支持的最大序列长度。
+            dim (int): RoPE应用的特征维度 (通常是每个注意力头的维度 d_head)。
+                       必须是偶数。
+            max_seq_len (int): 模型能处理的最大序列长度，用于预计算频率。
+            theta (float): RoPE中的基础周期参数，与论文中的theta一致。
+                           (注意：在一些实现中，这个参数可能被称为 `base`)
         """
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"RoPE的维度 'dim' ({dim}) 必须是偶数。")
 
-        # 创建一个足够大的位置编码矩阵(pe)
-        pe = torch.zeros(max_len, d_model)
-        # 生成位置信息 [max_len, 1]
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        # 计算除数项，用于sin和cos函数
-        # div_term 的形状是 [d_model/2]
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        # 计算频率，与Transformer的PositionalEncoding类似但用于旋转
+        # freqs 的形状是 (dim / 2)
+        # θ_i = base^(-2i/dim)
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
 
-        # 偶数维度使用sin函数
-        pe[:, 0::2] = torch.sin(position * div_term)
-        # 奇数维度使用cos函数
-        pe[:, 1::2] = torch.cos(position * div_term)
+        # t 代表位置索引 m，形状是 (max_seq_len)
+        t = torch.arange(max_seq_len, device=freqs.device)
+        # freqs_for_rotation (m * θ_i) 的形状是 (max_seq_len, dim / 2)
+        freqs_for_rotation = torch.outer(t, freqs)
 
-        # 增加一个批次维度，使其形状为 [1, max_len, d_model] 以便广播
-        pe = pe.unsqueeze(0)
-        # 将pe注册为buffer，这样它不会被视为模型参数，但会随模型移动(例如.to(device))
-        self.register_buffer('pe', pe)
+        # 缓存cos和sin值，形状 (1, max_seq_len, 1, dim / 2) 以便广播
+        # (bs, seq_len, n_heads, head_dim) -> RoPE作用于head_dim
+        # 如果Q/K是 (bs, n_heads, seq_len, head_dim)，那么cos/sin缓存需要匹配
+        # 我们在注意力模块中Q/K的形状是 (bs, n_heads, seq_len, head_dim)
+        # RoPE希望作用于最后一个维度，所以cos/sin需要是 (1, seq_len, 1, dim/2)
+        # 或者在应用时调整Q/K的维度顺序。
+        # 更通用的做法是让cos/sin的seq_len维度在前。
+        # (max_seq_len, dim // 2)
+        cos_cached = torch.cos(freqs_for_rotation)
+        sin_cached = torch.sin(freqs_for_rotation)
+
+        self.register_buffer("cos_cached", cos_cached, persistent=False)
+        self.register_buffer("sin_cached", sin_cached, persistent=False)
+        self.dim = dim
+
+    def _apply_rotary_emb(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """
+        对输入x应用旋转。
+
+        参数:
+            x (torch.Tensor): 输入张量, 形状 [B, H, S, D_h] 或 [B, S, D_model] (如果作用于整个d_model)。
+                              这里的D_h或D_model是RoPE作用的维度（即self.dim）。
+            cos (torch.Tensor): 对应序列长度的cos项, 形状 [S, D_h/2] 或 [S, D_model/2]。
+            sin (torch.Tensor): 对应序列长度的sin项, 形状 [S, D_h/2] 或 [S, D_model/2]。
+        返回:
+            torch.Tensor: 旋转后的张量。
+        """
+        # 将x的最后一维拆分为两半: x_even, x_odd
+        # x_even: x[..., 0:dim:2]
+        # x_odd:  x[..., 1:dim:2]
+        # 另一种实现方式：
+        # x_rope = x[..., :self.dim]
+        # x_pass = x[..., self.dim:] (如果只对部分维度应用RoPE)
+
+        # 这里我们假设x的最后一维完全用于RoPE (dim == x.shape[-1])
+        x_part1 = x[..., : self.dim // 2]  # (B, H, S, D_h/2)
+        x_part2 = x[..., self.dim // 2 :]  # (B, H, S, D_h/2)
+
+        # 调整cos和sin的形状以匹配x_part1/x_part2进行广播
+        # cos/sin: [S, D_h/2] -> [1, 1, S, D_h/2]
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+
+        # 应用旋转公式:
+        # x_rot_part1 = x_part1 * cos - x_part2 * sin
+        # x_rot_part2 = x_part1 * sin + x_part2 * cos
+        rotated_x_part1 = x_part1 * cos - x_part2 * sin
+        rotated_x_part2 = x_part1 * sin + x_part2 * cos
+
+        return torch.cat((rotated_x_part1, rotated_x_part2), dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        前向传播函数。
+        对输入张量x (通常是Q或K的多头表示) 应用旋转位置编码。
 
         参数:
-            x (torch.Tensor): 输入张量，形状为 [batch_size, seq_len, d_model]。
-
+            x (torch.Tensor): 输入张量，预期形状: [batch_size, num_heads, seq_len, head_dim]。
+                              RoPE将作用于最后一个维度 (head_dim)。
         返回:
-            torch.Tensor: 加入了位置编码的输出张量，形状与输入相同。
+            torch.Tensor: 应用RoPE后的张量，形状与x相同。
         """
-        # 将x与对应序列长度的位置编码相加
-        # self.pe的形状是 [1, max_len, d_model]，通过切片取前seq_len个位置
-        x = x + self.pe[:, :x.size(1), :]
-        return self.dropout(x)
+        # x: [B, H, S, D_h]
+        seq_len = x.shape[2] # S (序列长度)
+        # 取出对应长度的cos和sin缓存
+        cos = self.cos_cached[:seq_len] # [S, D_h/2]
+        sin = self.sin_cached[:seq_len] # [S, D_h/2]
+
+        return self._apply_rotary_emb(x, cos, sin)
 
 
 # --- 模块 2: 邻接亲和度计算器 (NeighborAffinityCalculator) ---
@@ -203,105 +252,191 @@ def build_hierarchical_attention_mask(affinity_scores_a: torch.Tensor | None,
     # 增加一个head维度以便广播: [batch_size, 1, seq_len, seq_len]
     return C.unsqueeze(1)
 
-
-# --- 模块 4: 带层级掩码的差分多头注意力 ---
-class DifferentialMultiHeadAttentionWithHierarchicalMask(nn.Module):
-    """
-    差分多头注意力机制，并结合了外部传入的层级掩码C。
-    """
-    def __init__(self, d_model: int, n_heads: int, dropout_rate_attention: float = 0.0, # DIFF论文未明确注意力dropout
-                 lambda_init_base: float = 0.8, lambda_init_scale: float = 0.6,
-                 lambda_init_factor: float = -0.3):
+# --- 模块 4: 缩放点积注意力 (基础单元) ---
+class ScaledDotProductAttention(nn.Module):
+    """计算缩放点积注意力权重。"""
+    def __init__(self, dropout_rate: float = 0.0): # 通常在MHA级别或子层级别应用dropout
         super().__init__()
-        assert d_model % n_heads == 0, "d_model 必须能被 n_heads 整除"
+        self.dropout = nn.Dropout(dropout_rate) # 可选的dropout，DIFF论文未明确在此处用
+
+    def forward(self, q_heads: torch.Tensor, k_heads: torch.Tensor,
+                padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        参数:
+            q_heads (torch.Tensor): Query张量, 形状 [B, H, S_q, D_h]。
+            k_heads (torch.Tensor): Key张量, 形状 [B, H, S_k, D_h]。
+            padding_mask (torch.Tensor | None): 填充掩码 (key的padding), 形状 [B, S_k]。
+                                                True为非padding, False为padding。
+        返回:
+            torch.Tensor: 注意力权重, 形状 [B, H, S_q, S_k]。
+        """
+        d_k = q_heads.size(-1)
+        scores = torch.matmul(q_heads, k_heads.transpose(-2, -1)) / math.sqrt(d_k) # [B, H, S_q, S_k]
+
+        if padding_mask is not None:
+            # padding_mask: [B, S_k] -> attn_padding_mask: [B, 1, 1, S_k]
+            attn_padding_mask = (padding_mask == 0).unsqueeze(1).unsqueeze(2) # True为padding位置
+            scores = scores.masked_fill(attn_padding_mask, -1e9)
+
+        attn_weights = F.softmax(scores, dim=-1)
+        # attn_weights = self.dropout(attn_weights) # 可选的dropout
+        return attn_weights
+
+
+# --- 模块 5: 差分注意力核心逻辑 ---
+class DifferentialAttentionCore(nn.Module):
+    """
+    计算差分注意力图的核心逻辑。
+    输出: diff_attn_map = softmax(A1) - λ * softmax(A2)
+    """
+    def __init__(self):
+        super().__init__()
+        self.sdpa1 = ScaledDotProductAttention() # 实例化基础的点积注意力
+        self.sdpa2 = ScaledDotProductAttention()
+
+    def forward(self,
+                q1_heads: torch.Tensor, k1_heads: torch.Tensor,
+                q2_heads: torch.Tensor, k2_heads: torch.Tensor,
+                learned_lambda: nn.Parameter,
+                padding_mask: torch.Tensor | None = None
+               ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        参数:
+            q1_heads, k1_heads, q2_heads, k2_heads: 两组Q, K头, 形状 [B, H, S, D_h]。
+            learned_lambda (nn.Parameter): 可学习的λ标量。
+            padding_mask (torch.Tensor | None): 填充掩码 (key的padding), 形状 [B, S_k]。
+        返回:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                - diff_attn_map (torch.Tensor): 差分注意力图, 形状 [B, H, S_q, S_k]。
+                - attn_weights1 (torch.Tensor): 第一个softmax注意力权重。
+                - attn_weights2 (torch.Tensor): 第二个softmax注意力权重。
+        """
+        attn_weights1 = self.sdpa1(q1_heads, k1_heads, padding_mask)
+        attn_weights2 = self.sdpa2(q2_heads, k2_heads, padding_mask)
+
+        diff_attn_map = attn_weights1 - learned_lambda * attn_weights2
+        return diff_attn_map, attn_weights1, attn_weights2
+
+
+# --- 模块 6: 多头QKV投影 (针对差分注意力) ---
+class DiffMultiHeadProjection(nn.Module):
+    """
+    将输入x投影到差分注意力所需的多头Q1, Q2, K1, K2, V。
+    """
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        assert d_model % n_heads == 0, "d_model必须能被n_heads整除"
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
-        self.scale_factor = math.sqrt(self.d_head)
 
-        self.wq_linear = nn.Linear(d_model, d_model * 2) # 投影到 (Q1, Q2)
-        self.wk_linear = nn.Linear(d_model, d_model * 2) # 投影到 (K1, K2)
-        self.wv_linear = nn.Linear(d_model, d_model)     # 投影到 V (共享)
+        # WQ, WK 将 d_model 映射到 n_heads * d_head * 2 (因为有Q1,K1和Q2,K2两组)
+        self.wq_linear = nn.Linear(d_model, d_model * 2)
+        self.wk_linear = nn.Linear(d_model, d_model * 2)
+        # WV 将 d_model 映射到 n_heads * d_head
+        self.wv_linear = nn.Linear(d_model, d_model)
+
+    def forward(self, x_norm: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        参数:
+            x_norm (torch.Tensor): 归一化后的输入, 形状 [B, S, D_model]。
+        返回:
+            q1_h, k1_h, q2_h, k2_h, v_h: 投影后的QKV头, 形状 [B, H, S, D_h]。
+        """
+        batch_size, seq_len, _ = x_norm.shape
+
+        q_proj = self.wq_linear(x_norm)  # [B, S, D_model*2]
+        k_proj = self.wk_linear(x_norm)  # [B, S, D_model*2]
+        v_proj = self.wv_linear(x_norm)  # [B, S, D_model] (V不拆分)
+
+        q1_h = q_proj[:, :, :self.d_model].view(batch_size, seq_len, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+        q2_h = q_proj[:, :, self.d_model:].view(batch_size, seq_len, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+        k1_h = k_proj[:, :, :self.d_model].view(batch_size, seq_len, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+        k2_h = k_proj[:, :, self.d_model:].view(batch_size, seq_len, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+        v_h = v_proj.view(batch_size, seq_len, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+
+        return q1_h, k1_h, q2_h, k2_h, v_h
+
+
+# --- 模块 7: (主) 带层级掩码的差分多头注意力 ---
+class HierarchicalDifferentialAttention(nn.Module):
+    """
+    集成了QKV投影、RoPE应用、差分注意力核心、层级掩码应用、上下文计算、
+    GroupNorm、λ_init缩放和输出投影。
+    """
+    def __init__(self, d_model: int, n_heads: int, rotary_emb_instance: RotaryEmbedding, # 接收RoPE实例
+                 lambda_init_base: float = 0.8, lambda_init_scale: float = 0.6,
+                 lambda_init_factor: float = -0.3):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_model = d_model
+        self.d_head = d_model // n_heads # 用于确认RoPE作用维度
+
+        self.projection = DiffMultiHeadProjection(d_model, n_heads)
+        self.rotary_emb = rotary_emb_instance # 存储RoPE实例
+        if self.rotary_emb.dim != self.d_head:
+            raise ValueError(f"RoPE维度({self.rotary_emb.dim})与注意力头维度({self.d_head})不匹配。")
+
+        self.diff_core = DifferentialAttentionCore()
         self.out_linear = nn.Linear(d_model, d_model)
+        self.group_norm = nn.GroupNorm(n_heads, d_model)
 
-        # GroupNorm，每个头独立归一化
-        self.group_norm = nn.GroupNorm(self.n_heads, self.d_model) # 对拼接后的d_model (C) 进行操作
-
-        # Dropout应用在 (DiffAttnWeights * C) @ V 之后，由外部EncoderLayer的dropout_sublayer处理
-
-        # λ_init 相关参数存储，用于计算固定的 (1 - λ_init) 缩放因子
         self.lambda_init_base = lambda_init_base
         self.lambda_init_scale = lambda_init_scale
         self.lambda_init_factor = lambda_init_factor
-        self.current_lambda_init = lambda_init_base # 会被 set_lambda_init 更新
+        self.current_lambda_init_for_scaling = lambda_init_base
 
     def set_lambda_init_for_scaling(self, layer_idx: int):
-        """
-        根据层索引计算并存储当前层的 λ_init 值，用于 (1-λ_init) 缩放。
-        此方法应在模块实例化后，但在第一次forward之前被外部调用。
-        """
-        # 论文中 l ∈ [1, L], 若我们的 layer_idx 是 0-indexed, 则 l-1 对应 layer_idx
         l_minus_1 = float(layer_idx)
-        self.current_lambda_init = self.lambda_init_base - self.lambda_init_scale * math.exp(self.lambda_init_factor * l_minus_1)
+        self.current_lambda_init_for_scaling = self.lambda_init_base - \
+                                               self.lambda_init_scale * \
+                                               math.exp(self.lambda_init_factor * l_minus_1)
 
-    def forward(self, x_norm: torch.Tensor, # 输入已经是归一化后的
+    def forward(self, x_norm: torch.Tensor,
                 learned_lambda: nn.Parameter,
-                hierarchical_mask_C: torch.Tensor, # 外部传入的层级掩码C
+                hierarchical_mask_C: torch.Tensor,
                 padding_mask: torch.Tensor | None = None
                ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         batch_size, seq_len, _ = x_norm.shape
 
-        q_proj = self.wq_linear(x_norm)
-        k_proj = self.wk_linear(x_norm)
-        v_proj = self.wv_linear(x_norm)
+        # 1. QKV投影
+        q1_h_no_rope, k1_h_no_rope, q2_h_no_rope, k2_h_no_rope, v_h = self.projection(x_norm)
 
-        q1 = q_proj[:, :, :self.d_model].view(batch_size, seq_len, self.n_heads, self.d_head).permute(0, 2, 1, 3)
-        q2 = q_proj[:, :, self.d_model:].view(batch_size, seq_len, self.n_heads, self.d_head).permute(0, 2, 1, 3)
-        k1 = k_proj[:, :, :self.d_model].view(batch_size, seq_len, self.n_heads, self.d_head).permute(0, 2, 1, 3)
-        k2 = k_proj[:, :, self.d_model:].view(batch_size, seq_len, self.n_heads, self.d_head).permute(0, 2, 1, 3)
-        v = v_proj.view(batch_size, seq_len, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+        # 1.5 应用RoPE到Q和K的各个头上
+        # RoPE的forward方法期望输入形状如 [B, H, S, D_h]
+        q1_h = self.rotary_emb(q1_h_no_rope)
+        k1_h = self.rotary_emb(k1_h_no_rope)
+        q2_h = self.rotary_emb(q2_h_no_rope)
+        k2_h = self.rotary_emb(k2_h_no_rope)
+        # V (v_h) 通常不应用RoPE
 
-        scores1 = torch.matmul(q1, k1.transpose(-2, -1)) / self.scale_factor
-        scores2 = torch.matmul(q2, k2.transpose(-2, -1)) / self.scale_factor
+        # 2. 计算差分注意力图
+        diff_attn_map, attn_w1, attn_w2 = self.diff_core(
+            q1_h, k1_h, q2_h, k2_h, learned_lambda, padding_mask
+        )
 
-        if padding_mask is not None:
-            attn_padding_mask = (padding_mask == 0).unsqueeze(1).unsqueeze(2)
-            scores1 = scores1.masked_fill(attn_padding_mask, -1e9)
-            scores2 = scores2.masked_fill(attn_padding_mask, -1e9)
-
-        attn_weights1 = F.softmax(scores1, dim=-1)
-        attn_weights2 = F.softmax(scores2, dim=-1)
-
-        # 计算差分注意力图
-        # diff_attn_map 形状: [B, H, S, S]
-        diff_attn_map = attn_weights1 - learned_lambda * attn_weights2
-
-        # 方案A: 将差分注意力图与层级掩码C结合
-        # hierarchical_mask_C: [B, 1, S, S]，会自动广播
-        # 注意：diff_attn_map可能包含负值。C通常是[0,1]之间的值。
-        # 乘积结果的解释性：C可以看作是路径的“可信度”或“连通性”，
-        # 它调节了差分注意力信号的强度。
+        # 3. 应用层级掩码 C
         combined_attn_map = hierarchical_mask_C * diff_attn_map
 
-        # 与 V 相乘得到上下文 (此时还未应用GroupNorm和λ_init缩放)
-        context_heads = torch.matmul(combined_attn_map, v) # [B, H, S, D_h]
+        # 4. 计算上下文向量
+        context_heads = torch.matmul(combined_attn_map, v_h)
 
-        # 合并多头
-        context_merged = context_heads.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, self.d_model) # [B, S, D]
+        # 5. 合并多头
+        context_merged = context_heads.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, self.d_model)
 
-        # 应用 GroupNorm
-        # 输入需要是 (N, C, L), 所以 [B, D, S]
-        context_normed = self.group_norm(context_merged.transpose(1, 2)).transpose(1, 2) # [B, S, D]
+        # 6. 应用GroupNorm
+        context_normed = self.group_norm(context_merged.transpose(1, 2)).transpose(1, 2)
 
-        # 应用 (1 - λ_init) 缩放因子
-        scaled_context = context_normed * (1.0 - self.current_lambda_init)
+        # 7. 应用 (1 - λ_init) 缩放
+        scaled_context = context_normed * (1.0 - self.current_lambda_init_for_scaling)
 
+        # 8. 输出投影
         output = self.out_linear(scaled_context)
 
-        return output, (attn_weights1, attn_weights2) # 返回原始的两个softmax权重图用于分析
+        return output, (attn_w1, attn_w2)
 
 
-# --- 模块 5: SwiGLU 前馈网络 ---
+# --- 模块 8: SwiGLU 前馈网络 ---
 class SwiGLUFFN(nn.Module):
     """
     SwiGLU 前馈网络。 FFN(x) = (Swish(x W_g) * (x W_1)) W_2
@@ -320,9 +455,10 @@ class SwiGLUFFN(nn.Module):
         return self.w_2(self.dropout_ffn_internal(gate_val * hidden_val))
 
 
-# --- 模块 6: 带差分注意力的层级编码器层 ---
+# --- 模块 9: 带差分注意力的层级编码器层 ---
 class HierarchicalDiffAttentionEncoderLayer(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout_rate: float = 0.1,
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, rotary_emb_instance: RotaryEmbedding, # 接收RoPE实例
+                 dropout_rate: float = 0.1,
                  layer_idx: int = 0,  # 当前层索引 (0-indexed)
                  d_k_neighbor: int | None = None, # 用于邻接亲和度计算
                  eps_norm: float = 1e-5 # RMSNorm的eps
@@ -338,8 +474,8 @@ class HierarchicalDiffAttentionEncoderLayer(nn.Module):
             print(f"警告: Layer {layer_idx} 未提供 d_k_neighbor, 层级掩码C将为全1。")
 
         # 实例化带层级掩码的差分注意力模块
-        self.diff_attn_hierarchical = DifferentialMultiHeadAttentionWithHierarchicalMask(
-            d_model, n_heads, dropout_rate_attention=0.0 # DIFF论文未明确注意力内部dropout
+        self.diff_attn_hierarchical = HierarchicalDifferentialAttention(
+            d_model, n_heads, rotary_emb_instance
         )
         # 为该层的差分注意力设置其 λ_init 值 (用于 (1-λ_init) 缩放)
         self.diff_attn_hierarchical.set_lambda_init_for_scaling(layer_idx)
@@ -406,7 +542,7 @@ class HierarchicalDiffAttentionEncoderLayer(nn.Module):
         return x, current_affinity_scores_a_out, attention_weights_tuple
 
 
-# --- 模块 7: 初步预测头 (PreliminaryPredictionHead) ---
+# --- 模块 10 初步预测头 (PreliminaryPredictionHead) ---
 class PreliminaryPredictionHead(nn.Module):
     """
     根据论文公式 (1) 进行初步的槽位(Slot)和意图(Intent)预测。
@@ -479,6 +615,8 @@ class PreliminaryPredictionHead(nn.Module):
         # 1. 计算句子的池化表示 Pooled(h)
         pooled_h_sentence = self._masked_average_pool(h, src_padding_mask) # [B, D]
 
+        # todo 在这里进行pooling到底是好还是坏
+        # todo 其次你必须把它从这里摘出来
         # 2. 准备拼接特征
         seq_len = h.size(1)
         # 将 pooled_h_sentence 扩展到与 h 的序列长度维度一致，以便拼接
@@ -498,30 +636,37 @@ class PreliminaryPredictionHead(nn.Module):
         return yI_prelim, yS_prelim
 
 
-# --- 模块 8: 层级差分注意力编码器 (主模型) ---
-class HierarchicalDiffEncoder(nn.Module):
+# --- 主模型: 层级差分注意力编码器 ---
+class HierarchicalDiffEncoderWithRoPE(nn.Module):
+    """主编码器模型，集成了层级差分注意力机制，并使用RoPE进行位置编码。"""
     def __init__(self, num_encoder_layers: int, d_model: int, n_heads: int, d_ff: int,
-                 input_vocab_size: int, max_len: int,
+                 input_vocab_size: int, max_seq_len: int, # max_seq_len 用于RoPE
                  num_slot_labels: int, num_intent_labels: int,
                  dropout_rate: float = 0.1, padding_idx: int = 0,
-                 d_k_neighbor: int | None = None # 如果为None，则不启用层级特性
+                 d_k_neighbor: int | None = None,
+                 rope_theta: float = 10000.0 # RoPE的theta参数
                 ):
         super().__init__()
         self.padding_idx = padding_idx
         self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
         self.d_k_neighbor = d_k_neighbor
 
         self.token_embedding = nn.Embedding(input_vocab_size, d_model, padding_idx=self.padding_idx)
-        self.pos_encoder = PositionalEncoding(d_model, dropout_rate, max_len)
+        # 按照方案A，在embedding后应用dropout
+        self.embedding_dropout = nn.Dropout(dropout_rate)
+        # 移除 self.pos_encoder
+
+        # 实例化RoPE模块，它将被所有层共享
+        self.rope_emb = RotaryEmbedding(dim=self.d_head, max_seq_len=max_seq_len, theta=rope_theta)
 
         self.layers = nn.ModuleList([
             HierarchicalDiffAttentionEncoderLayer(
                 d_model=d_model, n_heads=n_heads, d_ff=d_ff,
-                dropout_rate=dropout_rate,
-                layer_idx=i,
-                d_k_neighbor=d_k_neighbor
-            )
-            for i in range(num_encoder_layers)
+                rotary_emb_instance=self.rope_emb, # 将RoPE实例传递给每一层
+                dropout_rate=dropout_rate, layer_idx=i, d_k_neighbor=d_k_neighbor
+            ) for i in range(num_encoder_layers)
         ])
 
         self.prelim_predictor = None
@@ -531,16 +676,14 @@ class HierarchicalDiffEncoder(nn.Module):
     def forward(self, src_tokens: torch.Tensor) -> dict:
         src_padding_mask = (src_tokens != self.padding_idx)
         x = self.token_embedding(src_tokens) * math.sqrt(self.d_model)
-        x = self.pos_encoder(x) # Dropout在PositionalEncoding内部
+        x = self.embedding_dropout(x) # 应用词嵌入后的dropout
 
         current_affinity_scores_a_inter_layer = None
         all_layer_attention_weight_tuples = []
 
         for layer in self.layers:
             x, affinity_out, attention_weights_tuple = layer(
-                x,
-                src_padding_mask=src_padding_mask,
-                prev_affinity_scores_a=current_affinity_scores_a_inter_layer
+                x, src_padding_mask, current_affinity_scores_a_inter_layer
             )
             if self.d_k_neighbor is not None: # 只有在启用了层级特性时才更新
                 current_affinity_scores_a_inter_layer = affinity_out
@@ -567,62 +710,51 @@ if __name__ == '__main__':
     vocab_size = 1000
     d_model = 128
     n_heads = 4
+    # 对于SwiGLU, d_ff 通常是 d_model * (8/3) 或 d_model * 4。
+    # 但为了保持与之前示例的参数量相似性（如果PositionalEncoding很大），我们可能需要调整。
+    # 论文中Diff Transformer FFN size 是 8/3 * d_model * 2 (因为SwiGLU有两个线性层到d_ff)
+    # 这里简化 d_ff = d_model * 2 (指SwiGLU的中间维度)
     d_ff = d_model * 2 # SwiGLU 通常用 d_ff = d_model * 8/3 * 2，这里简化
     num_enc_layers = 2
-    max_seq_len = 60
+    max_seq_len_for_rope = 60 # 用于RoPE
     dropout = 0.1
     pad_idx = 0
     num_slots = 5
     num_intents = 2
     dk_neighbor_val = int(math.sqrt(d_model))
 
-    print("--- 测试带层级特性的层级差分注意力编码器 ---")
-    hier_diff_encoder = HierarchicalDiffEncoder(
-        num_encoder_layers=num_enc_layers, d_model=d_model, n_heads=n_heads, d_ff=d_ff,
-        input_vocab_size=vocab_size, max_len=max_seq_len,
-        num_slot_labels=num_slots, num_intent_labels=num_intents,
-        dropout_rate=dropout, padding_idx=pad_idx,
-        d_k_neighbor=dk_neighbor_val # 启用层级特性
+    print("--- 测试带RoPE和层级特性的层级差分注意力编码器 ---")
+    hier_diff_encoder_with_rope = HierarchicalDiffEncoderWithRoPE(
+        num_encoder_layers=num_enc_layers,
+        d_model=d_model,
+        n_heads=n_heads,
+        d_ff=d_ff,
+        input_vocab_size=vocab_size,
+        max_seq_len=max_seq_len_for_rope, # 传递给RoPE
+        num_slot_labels=num_slots,
+        num_intent_labels=num_intents,
+        dropout_rate=dropout,
+        padding_idx=pad_idx,
+        d_k_neighbor=dk_neighbor_val
     )
 
-    batch = 2
-    seq_len_val = 10
+    batch = 2; seq_len_val = 10 # 实际序列长度可以小于max_seq_len_for_rope
     dummy_tokens = torch.randint(1, vocab_size, (batch, seq_len_val))
     dummy_tokens[0, -3:] = pad_idx
 
-    hier_diff_encoder.eval()
+    hier_diff_encoder_with_rope.eval()
     with torch.no_grad():
-        outputs = hier_diff_encoder(dummy_tokens)
+        outputs_rope = hier_diff_encoder_with_rope(dummy_tokens)
 
-    print(f"编码器输出形状: {outputs['encoder_output'].shape}")
-    if outputs["prelim_slot_predictions"] is not None:
-        print(f"槽位预测形状: {outputs['prelim_slot_predictions'].shape}")
-    if outputs["final_affinity_scores_a"] is not None:
-        print(f"最终亲和度分数形状: {outputs['final_affinity_scores_a'].shape}")
-    else:
-        print("最终亲和度分数为 None (可能未启用层级特性或序列过短)")
+    print(f"带RoPE的编码器输出形状: {outputs_rope['encoder_output'].shape}")
+    if outputs_rope["prelim_slot_predictions"] is not None:
+        print(f"槽位预测形状: {outputs_rope['prelim_slot_predictions'].shape}")
+    if outputs_rope["final_affinity_scores_a"] is not None:
+        print(f"最终亲和度分数形状: {outputs_rope['final_affinity_scores_a'].shape}")
 
-    print(f"注意力权重元组列表长度: {len(outputs['all_layer_attention_weights'])}")
-    if outputs['all_layer_attention_weights']:
-        attn_tuple_l0 = outputs['all_layer_attention_weights'][0]
-        print(f"  第0层注意力权重元组长度: {len(attn_tuple_l0)}")
-        print(f"    第0层attn_weights1形状: {attn_tuple_l0[0].shape}")
-        print(f"    第0层attn_weights2形状: {attn_tuple_l0[1].shape}")
-
-    print("\n--- 测试不带层级特性的层级差分注意力编码器 (C将为全1) ---")
-    # d_k_neighbor=None 会使得C掩码为全1，相当于标准的差分注意力
-    plain_diff_encoder = HierarchicalDiffEncoder(
-        num_encoder_layers=num_enc_layers, d_model=d_model, n_heads=n_heads, d_ff=d_ff,
-        input_vocab_size=vocab_size, max_len=max_seq_len,
-        num_slot_labels=num_slots, num_intent_labels=num_intents,
-        dropout_rate=dropout, padding_idx=pad_idx,
-        d_k_neighbor=None # 不启用层级特性
-    )
-    plain_diff_encoder.eval()
-    with torch.no_grad():
-        outputs_plain = plain_diff_encoder(dummy_tokens)
-    print(f"编码器输出形状: {outputs_plain['encoder_output'].shape}")
-    if outputs_plain["final_affinity_scores_a"] is not None:
-        print(f"最终亲和度分数形状: {outputs_plain['final_affinity_scores_a'].shape}")
-    else:
-        print("最终亲和度分数为 None (因为d_k_neighbor=None)")
+    print(f"注意力权重元组列表长度: {len(outputs_rope['all_layer_attention_weights'])}")
+    if outputs_rope['all_layer_attention_weights']:
+        attn_tuple_l0_rope = outputs_rope['all_layer_attention_weights'][0]
+        print(f"  第0层注意力权重元组长度: {len(attn_tuple_l0_rope)}")
+        print(f"    第0层attn_weights1形状: {attn_tuple_l0_rope[0].shape}")
+        print(f"    第0层attn_weights2形状: {attn_tuple_l0_rope[1].shape}")

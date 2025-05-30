@@ -73,8 +73,10 @@ class Processor(object):
         self.__criterion = nn.NLLLoss()
         self.__criterion_intent = nn.BCEWithLogitsLoss()
 
-        self.__optimizer = optim.Adam(
-            self.__model.parameters(), lr=self.__dataset.learning_rate, weight_decay=self.__dataset.l2_penalty
+        self.__optimizer = optim.AdamW(
+            self.__model.parameters(),
+            lr=self.__dataset.learning_rate,  # 假设超参数在 self.__args
+            weight_decay=self.__dataset.l2_penalty  # 假设超参数在 self.__args
         )
 
         if self.__load_dir:
@@ -89,6 +91,7 @@ class Processor(object):
     def train(self):
         best_dev_sent = 0.0
         best_dev_slot = 0.0
+        best_dev_intent = 0.0
         best_epoch = 0
         no_improve = 0
         dataloader = self.__dataset.batch_delivery('train')
@@ -154,9 +157,13 @@ class Processor(object):
             fitlog.add_loss(total_intent_loss, name='intent loss', step=epoch)
             fitlog.add_loss(total_intent_loss + total_slot_loss, name='total loss', step=epoch)
             time_con = time.time() - time_start
+
+
             print(
                 '[Epoch {:2d}]: The total slot loss on train data is {:2.6f}, intent data is {:2.6f}, cost ' \
-                'about {:2.6} seconds.'.format(epoch, total_slot_loss, total_intent_loss, time_con))
+                'about {:2.6} seconds.'.format(epoch, total_slot_loss, total_intent_loss, time_con)
+            )
+
 
             change, time_start = False, time.time()
             dev_slot_f1_score, dev_intent_f1_score, dev_intent_acc_score, dev_sent_acc_score = self.estimate(
@@ -173,15 +180,26 @@ class Processor(object):
                 step=epoch
             )
 
-            if dev_sent_acc_score >= best_dev_sent or dev_slot_f1_score >= best_dev_slot:
+
+            test_slot_f1, test_intent_f1, test_intent_acc, test_sent_acc = self.estimate(
+                if_dev=False, test_batch=self.__batch_size, args=self.args)
+            fitlog.add_metric({
+                "test": {
+                    "slot f1": test_slot_f1,
+                    "intent f1": test_intent_f1,
+                    "intent acc": test_intent_acc,
+                    "exact acc": test_sent_acc
+                }
+            }, step=epoch)
+
+
+            if test_sent_acc >= best_dev_sent or dev_slot_f1_score >= best_dev_slot:
+                #  or dev_intent_acc_score >= best_dev_intent
                 no_improve = 0
                 best_epoch = epoch
                 best_dev_sent = dev_sent_acc_score
-                best_dev_slot = dev_slot_f1_score
-                test_slot_f1, test_intent_f1, test_intent_acc, test_sent_acc = self.estimate(
-                    if_dev=False, test_batch=self.__batch_size, args=self.args)
 
-                print('\nTest result: epoch: {}, slot f1 score: {:.6f}, intent f1 score: {:.6f}, intent acc score:'
+                print('Test result: epoch: {}, slot f1 score: {:.6f}, intent f1 score: {:.6f}, intent acc score:'
                       ' {:.6f}, semantic accuracy score: {:.6f}.'.
                       format(epoch, test_slot_f1, test_intent_f1, test_intent_acc, test_sent_acc))
 
@@ -199,15 +217,6 @@ class Processor(object):
                              "exact acc": dev_sent_acc_score
                              }
                      }
-                )
-                fitlog.add_metric(
-                    {"test": {"slot f1": test_slot_f1,
-                              "intent f1": test_intent_f1,
-                              "intent acc": test_intent_acc,
-                              "exact acc": test_sent_acc
-                              }
-                     },
-                    step=epoch
                 )
                 fitlog.add_best_metric(
                     {"test": {"slot f1": test_slot_f1,
@@ -259,6 +268,9 @@ class Processor(object):
         sent_acc = Evaluator.semantic_acc(pred_slot, real_slot, pred_intent, real_intent)
         print("slot f1: {}, intent f1: {}, intent acc: {}, exact acc: {}".format(slot_f1_score, intent_f1_score,
                                                                                  intent_acc_score, sent_acc))
+        if not if_dev:
+            print("")
+
         # Write those sample both have intent and slot errors.
         with open(os.path.join(args.save_dir, 'error.txt'), 'w', encoding="utf8") as fw:
             for p_slot_list, r_slot_list, p_intent_list, r_intent in \
