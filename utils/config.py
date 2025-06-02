@@ -2,49 +2,73 @@
 import argparse
 import torch
 
-parser = argparse.ArgumentParser(description='Fast and Accurate Non-Autoregressive Model for Joint Multiple Intent Detection and Slot Filling')
+parser = argparse.ArgumentParser(description='Configuration for Hierarchical Differential SLU Model')
 
-# Dataset and Other Parameters
-parser.add_argument('--data_dir', '-dd', help='dataset file path', type=str, default='./data/MixSNIPS_clean')
-parser.add_argument('--save_dir', '-sd', type=str, default='./save/MixSNIPS_clean')
-parser.add_argument('--load_dir', '-ld', type=str, default=None)
-parser.add_argument('--log_dir', '-lod', type=str, default='./log/MixSNIPS')
-parser.add_argument('--log_name', '-ln', type=str, default='log.txt')
-parser.add_argument("--random_state", '-rs', help='random seed', type=int, default=72)
-parser.add_argument('--gpu', '-g', action='store_true', help='use gpu', required=False, default=False)
+# --- Dataset and Other General Parameters ---
+parser.add_argument('--data_dir', '-dd', help='Dataset file path', type=str, default='./data/MixSNIPS_clean')
+parser.add_argument('--save_dir', '-sd', help='Directory to save models', type=str, default='./save/MixSNIPS_HDA_GCN')
+parser.add_argument('--load_dir', '-ld', help='Directory to load models from', type=str, default=None)
+parser.add_argument('--log_dir', '-lod', help='Directory to save logs', type=str, default='./log/MixSNIPS_HDA_GCN')
+parser.add_argument('--log_name', '-ln', help='Log file name', type=str, default='training_log.txt')
+parser.add_argument("--random_state", '-rs', help='Random seed', type=int, default=72)
+parser.add_argument('--gpu', '-g', action='store_true', help='Use GPU if available', default=torch.cuda.is_available())
+parser.add_argument('--padding_idx', help='Index of the padding token', type=int, default=0)
 
-# Training parameters.
-parser.add_argument('--num_epoch', '-ne', type=int, default=50)
-parser.add_argument('--batch_size', '-bs', type=int, default=16)
-parser.add_argument('--l2_penalty', '-lp', type=float, default=1e-5)
-parser.add_argument("--learning_rate", '-lr', type=float, default=0.001)
-parser.add_argument('--dropout_rate', '-dr', type=float, default=0.3)
-parser.add_argument('--gat_dropout_rate', '-gdr', type=float, default=0.3)
-parser.add_argument('--threshold', '-thr', type=float, default=0.5)
-parser.add_argument("--row_normalized", "-rn", action='store_true', help="row normalized for Adjacency matrix",
-                    required=False, default=True)
-parser.add_argument('--early_stop', action='store_true', default=False)
-parser.add_argument('--patience', '-pa', type=int, default=10)
-parser.add_argument('--intent_loss_alpha', '-lalpha', type=float, default=0.95)
-parser.add_argument('--slot_loss_alpha', '-salpha', type=float, default=0.05)
+# --- Training Parameters ---
+parser.add_argument('--num_epoch', '-ne', help='Number of training epochs', type=int, default=50)
+parser.add_argument('--batch_size', '-bs', help='Batch size for training', type=int, default=16)
+parser.add_argument('--l2_penalty', '-l2p', help='L2 regularization penalty', type=float, default=1e-5)
+parser.add_argument("--learning_rate", '-lr', help='Initial learning rate', type=float, default=0.001)
+parser.add_argument('--intent_loss_alpha', '-ila', help='Weight for intent loss', type=float, default=0.5) # 调整为更平衡的值
+parser.add_argument('--slot_loss_alpha', '-sla', help='Weight for slot loss', type=float, default=0.5)   # 调整为更平衡的值
+parser.add_argument('--early_stop', action='store_true', help='Enable early stopping', default=True) # 建议启用
+parser.add_argument('--patience', '-pa', help='Patience for early stopping', type=int, default=10)
+parser.add_argument('--intent_threshold', '-ithr', help='Threshold for binarizing intent probabilities', type=float, default=0.5)
+parser.add_argument('--slot_padding_token_id', help='ID for padding slot tokens in prediction output', type=int, default=0) # 通常与输入padding_idx一致
 
+# --- Hierarchical Differential Encoder (HDA) Parameters ---
+parser.add_argument('--num_encoder_layers', '-nel', help='Number of HDA encoder layers', type=int, default=4)
+parser.add_argument('--d_model', '-dm', help='Core model dimension (word embedding, encoder hidden)', type=int, default=128)
+parser.add_argument('--num_attention_heads', '-nah', help='Number of attention heads in HDA', type=int, default=2)
+parser.add_argument('--d_k_neighbor_divisor', '-dknd',
+                    help='Divisor for d_model to get d_k_neighbor (e.g., num_attention_heads for d_model/n_heads, 0 to disable affinity calc)',
+                    type=int, default=4) # 设为num_attention_heads
+parser.add_argument('--d_ff_multiplier', '-dffm', help='Multiplier for d_model to get FFN intermediate dim',
+                    type=int, default=2) # SwiGLU, 论文中FFN size = 8/3 * d_model
+parser.add_argument('--max_seq_len', '-msl', help='Maximum sequence length for RoPE', type=int, default=80)
+parser.add_argument('--rope_theta', '-rt', help='Theta parameter for RoPE', type=float, default=10000.0)
+parser.add_argument('--dropout_rate_encoder', '-dre', help='Dropout rate for HDA encoder components', type=float, default=0.1) # 论文中dropout_ratio=0.1
 
-# Model parameters.
-parser.add_argument('--n_heads', '-nh', type=int, default=4, help='Number of attention heads.')
-parser.add_argument('--alpha', '-alpha', type=float, default=0.2, help='Alpha for the leaky_relu.')
-parser.add_argument('--decoder_gat_hidden_dim', '-dghd', type=int, default=64,
-                    help='Number of decoder gat hidden units.')
-parser.add_argument('--slot_graph_window', '-sgw', type=int, default=2)
-parser.add_argument("--n_layers_decoder_global", '-nldg', help='GAT layers number of global decoder', type=int, default=2)
-parser.add_argument('--word_embedding_dim', '-wed', type=int, default=128)
+# --- Task-Specific Feature Transformation (after HDA) Parameters ---
+parser.add_argument('--d_intent_specific_hidden_dim', '-dishd', help='Dimension of intent-specific hidden states from HDA',
+                    type=int, default=128) # 可以与d_model一致
+parser.add_argument('--d_slot_specific_hidden_dim', '-dsshd', help='Dimension of slot-specific hidden states from HDA',
+                    type=int, default=128)   # 可以与d_model一致
 
-parser.add_argument('--encoder_hidden_dim', '-ehd', type=int, default=128)
+# --- GCN Interaction Module Parameters ---
+parser.add_argument('--use_gcn_interaction', '-ugcn', action='store_true', help='Use GCN interaction module after HDA', default=True) # 默认启用
+parser.add_argument('--num_gcn_layers', '-ngl', help='Number of GCN layers', type=int, default=1)
+parser.add_argument('--gcn_epsilon', '-geps', help='Epsilon for GCN normalization', type=float, default=1e-12)
+parser.add_argument('--gcn_activation_fn_str', '-gafs', help='Activation function for GCN (relu, gelu, tanh)', type=str, default="gelu")
+parser.add_argument('--gcn_affinity_power', '-gap', help='Power for affinity matrix in GCN to enhance contrast', type=float, default=1.0)
 
-parser.add_argument('--intent_embedding_dim', '-ied', type=int, default=128)
-parser.add_argument('--slot_decoder_hidden_dim', '-sdhd', type=int, default=128)
-parser.add_argument('--attention_hidden_dim', '-ahd', type=int, default=1024)
-parser.add_argument('--attention_output_dim', '-aod', type=int, default=128)
+# --- Decoder Parameters ---
+parser.add_argument('--dropout_rate_intent_decoder', '-drid', help='Dropout rate for intent decoder', type=float, default=0.1)
+parser.add_argument('--dropout_rate_slot_decoder', '-drsd', help='Dropout rate for slot decoder', type=float, default=0.1)
+
 
 args = parser.parse_args()
-args.gpu = args.gpu and torch.cuda.is_available()
-print(str(vars(args)))
+
+
+# Ensure GPU is used if specified and available
+if args.gpu and not torch.cuda.is_available():
+    print("Warning: GPU was requested but is not available. Using CPU instead.")
+    args.gpu = False
+elif not args.gpu and torch.cuda.is_available():
+    print("Information: GPU is available but not requested. Using CPU. Add -g or --gpu to use GPU.")
+
+
+print("--- Parsed Configuration ---")
+for arg_name, value in sorted(vars(args).items()):
+    print(f"  {arg_name}: {value}")
+print("--------------------------")

@@ -3,121 +3,11 @@
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn.utils.rnn import pack_padded_sequence
-from torch.nn.utils.rnn import pad_packed_sequence
-from torch.nn.parameter import Parameter
-import numpy as np
 
-from models.HDAEncoder import HierarchicalDiffEncoderWithRoPE
-from utils.process import normalize_adj
-
-
-class GraphAttentionLayer(nn.Module):
-    """
-    Simple GAT layer, similar to https://arxiv.org/abs/1710.10903
-    """
-
-    def __init__(self, in_features, out_features, dropout, alpha, concat=True):
-        super(GraphAttentionLayer, self).__init__()
-        self.dropout = dropout
-        self.in_features = in_features
-        self.out_features = out_features
-        self.alpha = alpha
-        self.concat = concat
-
-        self.W = nn.Parameter(torch.zeros(size=(in_features, out_features)))
-        nn.init.xavier_uniform_(self.W.data, gain=1.414)
-        self.a = nn.Parameter(torch.zeros(size=(2 * out_features, 1)))
-        nn.init.xavier_uniform_(self.a.data, gain=1.414)
-
-        self.leakyrelu = nn.LeakyReLU(self.alpha)
-
-    def forward(self, input, adj):
-        h = torch.matmul(input, self.W)
-        B, N = h.size()[0], h.size()[1]
-
-        a_input = torch.cat([h.repeat(1, 1, N).view(B, N * N, -1), h.repeat(1, N, 1)], dim=2).view(B, N, -1,
-                                                                                                   2 * self.out_features)
-        e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(3))
-
-        zero_vec = -9e15 * torch.ones_like(e)
-        attention = torch.where(adj > 0, e, zero_vec)
-        attention = F.softmax(attention, dim=2)
-        # attention = F.dropout(attention, self.dropout, training=self.training)
-        h_prime = torch.matmul(attention, h)
-
-        if self.concat:
-            return F.elu(h_prime)
-        else:
-            return h_prime
-
-    def __repr__(self):
-        return self.__class__.__name__ + ' (' + str(self.in_features) + ' -> ' + str(self.out_features) + ')'
-
-
-class GAT(nn.Module):
-    def __init__(self, nfeat, nhid, nclass, dropout, alpha, nheads, nlayers=2):
-        """Dense version of GAT."""
-        super(GAT, self).__init__()
-        self.dropout = dropout
-        self.nlayers = nlayers
-        self.nheads = nheads
-        self.attentions = [GraphAttentionLayer(nfeat, nhid, dropout=dropout, alpha=alpha, concat=True) for _ in
-                           range(nheads)]
-        for i, attention in enumerate(self.attentions):
-            self.add_module('attention_{}'.format(i), attention)
-        if self.nlayers > 2:
-            for i in range(self.nlayers - 2):
-                for j in range(self.nheads):
-                    self.add_module('attention_{}_{}'.format(i + 1, j),
-                                    GraphAttentionLayer(nhid * nheads, nhid, dropout=dropout, alpha=alpha, concat=True))
-
-        self.out_att = GraphAttentionLayer(nhid * nheads, nclass, dropout=dropout, alpha=alpha, concat=False)
-
-    def forward(self, x, adj):
-        x = F.dropout(x, self.dropout, training=self.training)
-        input = x
-        x = torch.cat([att(x, adj) for att in self.attentions], dim=2)
-        if self.nlayers > 2:
-            for i in range(self.nlayers - 2):
-                temp = []
-                x = F.dropout(x, self.dropout, training=self.training)
-                cur_input = x
-                for j in range(self.nheads):
-                    temp.append(self.__getattr__('attention_{}_{}'.format(i + 1, j))(x, adj))
-                x = torch.cat(temp, dim=2) + cur_input
-        x = F.dropout(x, self.dropout, training=self.training)
-        x = F.elu(self.out_att(x, adj))
-        return x + input
-
-
-class Encoder(nn.Module):
-    def __init__(self, args):
-        super().__init__()
-
-        self.__args = args
-
-        # Initialize an LSTM Encoder object.
-        self.__encoder = LSTMEncoder(
-            self.__args.word_embedding_dim,
-            self.__args.encoder_hidden_dim,
-            self.__args.dropout_rate
-        )
-
-        # Initialize an self-attention layer.
-        self.__attention = SelfAttention(
-            self.__args.word_embedding_dim,
-            self.__args.attention_hidden_dim,
-            self.__args.attention_output_dim,
-            self.__args.dropout_rate
-        )
-
-    def forward(self, word_tensor, seq_lens):
-        lstm_hiddens = self.__encoder(word_tensor, seq_lens)
-        attention_hiddens = self.__attention(word_tensor, seq_lens)
-        hiddens = torch.cat([attention_hiddens, lstm_hiddens], dim=2)
-        return hiddens
+from models.GCNModule import GCNInteractionModule
+from models.HDAEncoder import HierarchicalDiffEncoderWithRoPE, build_hierarchical_attention_mask
+from models.SVIDecoder import SoftVotingIntentDecoder
+from models.slotDecoder import SlotDecoder
 
 
 class ModelManager(nn.Module):
@@ -128,408 +18,241 @@ class ModelManager(nn.Module):
         self.__num_word = num_word
         self.__num_slot = num_slot
         self.__num_intent = num_intent
-        self.__args = args
+        self.__args = args  # 存储args
 
-        # self.__embedding = nn.Embedding(
-        #     self.__num_word,
-        #     self.__args.word_embedding_dim
-        # )
 
-        num_enc_layers = 3  # Encoder层数 (论文Table1后 Ne=4)
-        d_model = 128  # Transformer 输入输出维度 (论文Table1后 Ne=4, d_model=128)
-        n_heads = 2  # 注意力头数
-        d_k_neighbor = math.sqrt(d_model)  # 公式(3)中的 d_s, 论文未明确, 合理假设为sqrt(d_model)或d_model/n_heads
-        d_ff = d_model * 2  # FFN中间层维度, Transformer常见设置为4*d_model (论文未明确, 这是常见做法)
-        max_seq_len = 80  # 假设的最大序列长度
-        dropout_rate = 0.1  # Dropout比例 (论文Table1后 dropout_ratio=0.1)
-        padding_idx = 0  # Padding token的ID
+        # d_k_neighbor calculation logic remains, but inputs come from self.__args
+        d_k_neighbor_val = self.__args.d_model // self.__args.d_k_neighbor_divisor \
+            if self.__args.d_k_neighbor_divisor > 0 \
+            else int(math.sqrt(self.__args.d_model))
+
+        d_ff_val = self.__args.d_model * self.__args.d_ff_multiplier
 
         self.__HDA_encoder = HierarchicalDiffEncoderWithRoPE(
-            num_encoder_layers=num_enc_layers,
-            d_model=d_model,
-            n_heads=n_heads,
-            d_k_neighbor=int(d_k_neighbor),
-            d_ff=d_ff,
+            num_encoder_layers=self.__args.num_encoder_layers,
+            d_model=self.__args.d_model,
+            n_heads=self.__args.num_attention_heads,  # Note: Renamed in config, using new name
+            d_k_neighbor=int(d_k_neighbor_val) if d_k_neighbor_val > 0 else None,
+            d_ff=d_ff_val,
             input_vocab_size=self.__num_word,
-            max_seq_len=max_seq_len,
-            num_slot_labels=0,
-            num_intent_labels=self.__num_intent,
-            dropout_rate=dropout_rate,
-            padding_idx=padding_idx
+            max_seq_len=self.__args.max_seq_len,
+            d_intent_hidden_dim=self.__args.d_intent_specific_hidden_dim,
+            d_slot_hidden_dim=self.__args.d_slot_specific_hidden_dim,
+            rope_theta=self.__args.rope_theta,
+            dropout_rate=self.__args.dropout_rate_encoder,  # Using specific encoder dropout
+            padding_idx=self.__args.padding_idx,
         )
 
-        # self.G_encoder = Encoder(args)
-        # Initialize an Decoder object for intent.
-        self.__intent_decoder = nn.Sequential(
-            nn.Linear(self.__args.encoder_hidden_dim, self.__args.encoder_hidden_dim ),
-            nn.LeakyReLU(args.alpha),
-            nn.Linear(self.__args.encoder_hidden_dim, self.__num_intent),
+        # --- GCN Interaction Module (if启用) from self.__args ---
+        self.use_gcn = self.__args.use_gcn_interaction  # Assuming this is in args
+        if self.use_gcn:
+            self.__GCN_interaction_module = GCNInteractionModule(
+                d_intent=self.__args.d_intent_specific_hidden_dim,
+                d_slot=self.__args.d_slot_specific_hidden_dim,
+                num_gcn_layers=self.__args.num_gcn_layers,
+                gcn_epsilon=self.__args.gcn_epsilon,
+                gcn_activation_fn_str=self.__args.gcn_activation_fn_str,
+                gcn_affinity_power=self.__args.gcn_affinity_power,
+            )
+        else:
+            self.__GCN_interaction_module = None
+
+        # --- Decoders Parameters from self.__args ---
+        self.__intent_decoder = SoftVotingIntentDecoder(
+            hidden_dim=self.__args.d_intent_specific_hidden_dim,
+            num_intents=self.__num_intent,
+            dropout_rate=self.__args.dropout_rate_intent_decoder
         )
 
-        self.__intent_embedding = nn.Parameter(
-            torch.FloatTensor(self.__num_intent, self.__args.intent_embedding_dim))  # 191, 32
-        nn.init.normal_(self.__intent_embedding.data)
-
-        self.__slot_lstm = LSTMEncoder(
-            self.__args.encoder_hidden_dim + num_intent,
-            self.__args.slot_decoder_hidden_dim,
-            self.__args.dropout_rate
+        self.__slot_decoder = SlotDecoder(
+            hidden_dim=self.__args.d_slot_specific_hidden_dim,
+            num_slot_labels=self.__num_slot,
+            dropout_rate=self.__args.dropout_rate_slot_decoder
         )
-        self.__intent_lstm = LSTMEncoder(
-            self.__args.encoder_hidden_dim + self.__args.attention_output_dim,
-            self.__args.encoder_hidden_dim + self.__args.attention_output_dim,
-            self.__args.dropout_rate
-        )
-
-        self.__slot_decoder = LSTMDecoder(
-            args,
-            self.__args.encoder_hidden_dim + self.__args.attention_output_dim,
-            self.__args.slot_decoder_hidden_dim,
-            self.__num_slot, self.__args.dropout_rate)
 
     def show_summary(self):
         """
         print the abstract of the defined model.
         """
-
         print('Model parameters are listed as follows:\n')
+        print(f'\tNumber of word:                            {self.__num_word}')
+        print(f'\tNumber of slot:                            {self.__num_slot}')
+        print(f'\tNumber of intent:                          {self.__num_intent}')
 
-        print('\tnumber of word:                            {};'.format(self.__num_word))
-        print('\tnumber of slot:                            {};'.format(self.__num_slot))
-        print('\tnumber of intent:						    {};'.format(self.__num_intent))
-        print('\tword embedding dimension:				    {};'.format(self.__args.word_embedding_dim))
-        print('\tencoder hidden dimension:				    {};'.format(self.__args.encoder_hidden_dim))
-        print('\tdimension of intent embedding:		    	{};'.format(self.__args.intent_embedding_dim))
-        print('\tdimension of slot decoder hidden:  	    {};'.format(self.__args.slot_decoder_hidden_dim))
-        print('\thidden dimension of self-attention:        {};'.format(self.__args.attention_hidden_dim))
-        print('\toutput dimension of self-attention:        {};'.format(self.__args.attention_output_dim))
+        # HDA Encoder Params
+        hda_config = self.__HDA_encoder
+        print(f'\tEncoder Type:                              HierarchicalDiffEncoderWithRoPE')
+        print(f'\t  Encoder Layers:                          {len(hda_config.layers)}')
+        print(f'\t  Model Dimension (d_model):               {hda_config.d_model}')
+        print(f'\t  Number of Attention Heads:               {hda_config.n_heads}')
+        print(f'\t  Feed-Forward Dimension (d_ff):           {hda_config.layers[0].ffn.w_1.out_features if hda_config.layers else "N/A"}')
+        print(f'\t  Max Sequence Length (for RoPE):          {hda_config.rope_emb.cos_cached.shape[0]}')
+        print(f'\t  RoPE Theta:                              {hda_config.rope_emb.freqs_cis.real.exp().pow(-hda_config.rope_emb.dim / 2).mean().item() if hasattr(hda_config.rope_emb, "freqs_cis") else "N/A"}') # 估算theta
+        print(f'\t  Dropout Rate (Encoder):                  {hda_config.embedding_dropout.p}')
+        print(f'\t  Padding Index:                           {hda_config.padding_idx}')
+        print(f'\t  d_k_neighbor (Affinity Calc):            {hda_config.d_k_neighbor if hda_config.d_k_neighbor is not None else "Disabled"}')
+        if hda_config.task_feature_transformer:
+            print(f'\t  Intent Specific Hidden Dim (HDA out):  {hda_config.task_feature_transformer.d_intent_hidden_dim}')
+            print(f'\t  Slot Specific Hidden Dim (HDA out):    {hda_config.task_feature_transformer.d_slot_hidden_dim}')
+        else:
+            print(f'\t  Intent Specific Hidden Dim (HDA out):  N/A (Direct from d_model)')
+            print(f'\t  Slot Specific Hidden Dim (HDA out):    N/A (Direct from d_model)')
+
+
+        # GCN Module Params
+        if self.__GCN_interaction_module:
+            gcn_config = self.__GCN_interaction_module
+            print(f'\tGCN Interaction Module:                  Enabled')
+            print(f'\t  GCN Layers:                            {len(gcn_config.gcn_layers)}')
+            print(f'\t  GCN Activation:                        {gcn_config.gcn_layers[0].activation_fn.__name__ if gcn_config.gcn_layers else "N/A"}')
+            print(f'\t  GCN Affinity Power:                    {gcn_config.gcn_layers[0].affinity_power if gcn_config.gcn_layers else "N/A"}')
+        else:
+            print(f'\tGCN Interaction Module:                  Disabled')
+
+        # Intent Decoder Params
+        intent_dec_config = self.__intent_decoder
+        print(f'\tIntent Decoder Type:                       SoftVotingIntentDecoder')
+        print(f'\t  Intent Decoder Hidden Dim:               {intent_dec_config.hidden_dim}')
+        print(f'\t  Dropout Rate (Intent Decoder):           {intent_dec_config.dropout.p}')
+
+        # Slot Decoder Params
+        slot_dec_config = self.__slot_decoder
+        print(f'\tSlot Decoder Type:                         SlotDecoder')
+        print(f'\t  Slot Decoder Hidden Dim:                 {slot_dec_config.hidden_dim}')
+        print(f'\t  Dropout Rate (Slot Decoder):             {slot_dec_config.dropout.p}')
 
         print('\nEnd of parameters show. Now training begins.\n\n')
 
-    def generate_global_adj_gat(self, seq_len, index, batch, window):
-        global_intent_idx = [[] for i in range(batch)]
-        global_slot_idx = [[] for i in range(batch)]
-        for item in index:
-            global_intent_idx[item[0]].append(item[1])
 
-        for i, len in enumerate(seq_len):
-            global_slot_idx[i].extend(list(range(self.__num_intent, self.__num_intent + len)))
-
-        adj = torch.cat([torch.eye(self.__num_intent + seq_len[0]).unsqueeze(0) for i in range(batch)])
-        for i in range(batch):
-            for j in global_intent_idx[i]:
-                adj[i, j, global_slot_idx[i]] = 1.
-                adj[i, j, global_intent_idx[i]] = 1.
-            for j in global_slot_idx[i]:
-                adj[i, j, global_intent_idx[i]] = 1.
-
-        for i in range(batch):
-            for j in range(self.__num_intent, self.__num_intent + seq_len[i]):
-                adj[i, j, max(self.__num_intent, j - window):min(seq_len[i] + self.__num_intent, j + window + 1)] = 1.
-
-        if self.__args.row_normalized:
-            adj = normalize_adj(adj)
-        if self.__args.gpu:
-            adj = adj.cuda()
-        return adj
-
-    def generate_slot_adj_gat(self, seq_len, batch, window):
-        slot_idx_ = [[] for i in range(batch)]
-        adj = torch.cat([torch.eye(seq_len[0]).unsqueeze(0) for i in range(batch)])
-        for i in range(batch):
-            for j in range(seq_len[i]):
-                adj[i, j, max(0, j - window):min(seq_len[i], j + window + 1)] = 1.
-        if self.__args.row_normalized:
-            adj = normalize_adj(adj)
-        if self.__args.gpu:
-            adj = adj.cuda()
-        return adj
-
-    def forward(self, text_token_ids, seq_lens, n_predicts=None):
+    def forward(self, text_token_ids):
         # 1. HDA Encoder
+        #    - hda_encoder_outputs 是一个字典，包含:
+        #      "encoder_output": (B, S, D_model) - 最终的共享编码器输出 (可能不需要直接使用)
+        #      "intent_specific_hidden_states": (B, S, D_intent_specific) 或 (B, D_intent_specific) 如果池化
+        #      "slot_specific_hidden_states": (B, S, D_slot_specific)
+        #      "final_affinity_scores_a": (B, S-1) - 最后一层的 'a' 分数，用于GCN
+        #      "all_layer_attention_weights": 列表，包含每层的 (attn_w1, attn_w2)
+        #      "source_padding_mask": (B, S) - True为非padding
         hda_encoder_outputs = self.__HDA_encoder(text_token_ids)
-        # g_hiddens: (batch, seq_len, d_model) - token的上下文表示
-        g_hiddens = hda_encoder_outputs["encoder_output"]
-        # pred_intent_logits_all: (batch, seq_len, num_total_intent) - token级初步意图logits
-        pred_intent = hda_encoder_outputs["prelim_intent_predictions"]
-        affinity = hda_encoder_outputs["final_affinity_scores_a"]
-    #     todo 在这里设置一个 affinity_scores，真的有用吗？
-    #     todo 或者说，你给如何增大这一设计的作用
 
-    #     intent_lstm_out = self.__intent_lstm(g_hiddens, seq_lens)
-    #     intent_lstm_out = F.dropout(intent_lstm_out, p=self.__args.dropout_rate, training=self.training)
-    #     pred_intent = self.__intent_decoder(intent_lstm_out)
-        seq_lens_tensor = torch.tensor(seq_lens)
-        if self.__args.gpu:
-            seq_lens_tensor = seq_lens_tensor.cuda()
-        intent_index_sum = torch.cat(
-            [
-                torch.sum(torch.sigmoid(pred_intent[i, 0:seq_lens[i], :]) > self.__args.threshold, dim=0).unsqueeze(0)
-                for i in range(len(seq_lens))
-            ],
-            dim=0
-        )
+        h_intent_for_decoder = hda_encoder_outputs["intent_specific_hidden_states"]
+        h_slot_for_decoder = hda_encoder_outputs["slot_specific_hidden_states"]
+        final_affinity_scores_a = hda_encoder_outputs["final_affinity_scores_a"]
+        padding_mask_bool = hda_encoder_outputs["source_padding_mask"] # (B,S) True for non-padding
 
-        intent_index = (intent_index_sum > (seq_lens_tensor // 2).unsqueeze(1)).nonzero()
+        # 2. Affinity-based GCN Interaction Module (如果启用)
+        if self.__GCN_interaction_module and final_affinity_scores_a is not None:
+            # GCN期望的affinity_matrix是 (B, S, S)
+            # 我们从HDA得到的是 (B, S-1) 的 a_k,k+1
+            # 需要从 final_affinity_scores_a 构建完整的亲和力矩阵 C
+            # 注意: build_hierarchical_attention_mask 返回的是 [B, 1, S, S]
+            # GCN 需要的是 [B, S, S]
+            affinity_matrix_C_for_gcn = build_hierarchical_attention_mask(
+                final_affinity_scores_a, text_token_ids.size(1), text_token_ids.device
+            ).squeeze(1) # 移除head维度
 
-        # # 1. 对每个词元的意图 logits 应用 Softmax (在所有意图上，包括 "no_intent")
-        # token_intent_probs = F.softmax(pred_intent, dim=-1)
-        # # 2. 找出每个词元概率最高的意图 (argmax)
-        # token_dominant_intent_indices = torch.argmax(token_intent_probs, dim=-1)
-        # # 3. 创建一个掩码，用于在统计时忽略 padding 部分 和 "no_intent" 的主导情况
-        # sequence_mask = (torch.arange(pred_intent.size(1), device=pred_intent.device)[None, :] <
-        #                  torch.tensor(seq_lens, device=pred_intent.device)[:, None])
-        # # 其次，标记那些主导意图不是 "no_intent" 的 token
-        # is_meaningful_intent_token = (token_dominant_intent_indices != (self.__num_intent - 1))
-        # # 合并掩码：必须是有效token 且 主导意图不是 "no_intent"
-        # final_token_mask_for_counting = sequence_mask & is_meaningful_intent_token
-        # # 4. 高效统计每个句子中，各个真实意图作为“主要意图”出现的次数
-        # # 我们只关心前 num_intent - 1 个真实意图
-        # one_hot_dominant_meaningful_intents = F.one_hot(token_dominant_intent_indices,
-        #                                                     num_classes=self.__num_intent)[:, :, :-1]  # 取前num_intent-1个
-        # masked_one_hot = one_hot_dominant_meaningful_intents * final_token_mask_for_counting.unsqueeze(-1)
-        # intent_counts_meaningful = torch.sum(masked_one_hot, dim=1)  # 形状 (batch, num_intent - 1)
-        # seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.float32, device=pred_intent.device)
-        # min_token_ratio_for_intent = getattr(self.__args, 'min_token_ratio_for_intent', 1.0 / 4.0)
-        # threshold_counts_per_sentence = (seq_lens_tensor * min_token_ratio_for_intent).unsqueeze(1)
-        #
-        # is_sentence_intent = (intent_counts_meaningful.float() > threshold_counts_per_sentence)
-        # intent_index = is_sentence_intent.nonzero()  # 形状 (num_found_intents, 2)
-
-
-        # todo 然后就是 Interaction_module 这一块是必须要好好设计的模块
-        slot_lstm_out = self.__slot_lstm(torch.cat([g_hiddens, pred_intent], dim=-1), seq_lens)
-        global_adj = self.generate_global_adj_gat(seq_lens, intent_index, len(pred_intent),
-                                                  self.__args.slot_graph_window)
-        slot_adj = self.generate_slot_adj_gat(seq_lens, len(pred_intent), self.__args.slot_graph_window)
-        pred_slot = self.__slot_decoder(
-            slot_lstm_out,
-            seq_lens,
-            global_adj=global_adj,
-            slot_adj=slot_adj,
-            intent_embedding=self.__intent_embedding
-        )
-        if n_predicts is None:
-            return F.log_softmax(pred_slot, dim=1), pred_intent
-        else:
-            _, slot_index = pred_slot.topk(n_predicts, dim=1)
-
-            intent_index_sum = torch.cat(
-                [
-                    torch.sum(torch.sigmoid(pred_intent[i, 0:seq_lens[i], :]) > self.__args.threshold, dim=0).unsqueeze(
-                        0)
-                    for i in range(len(seq_lens))
-                ],
-                dim=0
+            h_intent_gcn_out, h_slot_gcn_out = self.__GCN_interaction_module(
+                h_intent_input=h_intent_for_decoder,
+                h_slot_input=h_slot_for_decoder,
+                affinity_matrix=affinity_matrix_C_for_gcn,
+                padding_mask=padding_mask_bool
             )
-            intent_index = (intent_index_sum > (seq_lens_tensor // 2).unsqueeze(1)).nonzero()
+            # 更新用于解码器的隐藏状态
+            h_intent_for_decoder = h_intent_gcn_out
+            h_slot_for_decoder = h_slot_gcn_out
+        elif self.__GCN_interaction_module and final_affinity_scores_a is None:
+            # 如果启用了GCN但没有亲和力分数 (例如，序列太短或HDA的d_k_neighbor为None)
+            # 可以选择跳过GCN，或者使用一个默认的全连接/单位亲和力矩阵
+            print("警告: GCN模块已启用，但最终亲和力分数为None。将跳过GCN交互。")
+            pass # h_intent_for_decoder 和 h_slot_for_decoder 保持不变
 
-            # todo 最后就是解码器啦，解码器要为意图多设计一个 no_intent 门控机制
-            return slot_index.cpu().data.numpy().tolist(), intent_index.cpu().data.numpy().tolist()
 
-
-class LSTMEncoder(nn.Module):
-    """
-    Encoder structure based on bidirectional LSTM.
-    """
-
-    def __init__(self, embedding_dim, hidden_dim, dropout_rate):
-        super(LSTMEncoder, self).__init__()
-
-        # Parameter recording.
-        self.__embedding_dim = embedding_dim
-        self.__hidden_dim = hidden_dim // 2
-        self.__dropout_rate = dropout_rate
-
-        # Network attributes.
-        self.__dropout_layer = nn.Dropout(self.__dropout_rate)
-        self.__lstm_layer = nn.LSTM(
-            input_size=self.__embedding_dim,
-            hidden_size=self.__hidden_dim,
-            batch_first=True,
-            bidirectional=True,
-            # dropout=self.__dropout_rate,
-            num_layers=1
+        # 3. Intent Decoder
+        # SoftVotingIntentDecoder 需要 (B, S, D_intent) 的输入
+        # 以及 (B, S, 1) 的padding_mask (1 for non-padding)
+        intent_padding_mask_for_decoder = padding_mask_bool.unsqueeze(-1).float()
+        intent_logits, intent_probs, _, _ = self.__intent_decoder(
+            token_encodings=h_intent_for_decoder,
+            padding_mask=intent_padding_mask_for_decoder
         )
 
-    def forward(self, embedded_text, seq_lens):
-        # print(embedded_text.size()) # torch.Size([16, 38, 256])
-        # torch.Size([16, 48, 384])
-        # torch.Size([16, 48, 402])
+        # 4. Slot Decoder
+        # SlotDecoder 需要 (B, S, D_slot) 的输入
+        slot_logits, slot_probs = self.__slot_decoder(
+            token_encodings=h_slot_for_decoder
+            # SlotDecoder的padding_mask是可选的，主要用于损失计算或预测提取
+        )
 
-        """ Forward process for LSTM Encoder.
+        # 返回训练所需的logits
+        return intent_logits, slot_logits # 或者根据训练目标返回probs
 
-        (batch_size, max_sent_len)
-        -> (batch_size, max_sent_len, word_dim)
-        -> (batch_size, max_sent_len, hidden_dim)
-
-        :param embedded_text: padded and embedded input text.
-        :param seq_lens: is the length of original input text.
-        :return: is encoded word hidden vectors.
+    @torch.no_grad()
+    def predict(self, text_token_ids, seq_lens=None, intent_threshold=0.5):
         """
-
-        # Padded_text should be instance of LongTensor.
-        dropout_text = self.__dropout_layer(embedded_text)
-
-        # Pack and Pad process for input of variable length.
-        packed_text = pack_padded_sequence(dropout_text, seq_lens, batch_first=True)
-        lstm_hiddens, (h_last, c_last) = self.__lstm_layer(packed_text)
-        padded_hiddens, _ = pad_packed_sequence(lstm_hiddens, batch_first=True)
-
-        return padded_hiddens
-
-
-class LSTMDecoder(nn.Module):
-    """
-    Decoder structure based on unidirectional LSTM.
-    """
-
-    def __init__(self, args, input_dim, hidden_dim, output_dim, dropout_rate, embedding_dim=None, extra_dim=None):
-        """ Construction function for Decoder.
-
-        :param input_dim: input dimension of Decoder. In fact, it's encoder hidden size.
-        :param hidden_dim: hidden dimension of iterative LSTM.
-        :param output_dim: output dimension of Decoder. In fact, it's total number of intent or slot.
-        :param dropout_rate: dropout rate of network which is only useful for embedding.
+        进行预测。
+        参数:
+            text_token_ids (torch.Tensor): 输入的token ID, 形状 [batch_size, seq_len]。
+            seq_lens (torch.Tensor, optional): 每个序列的实际长度，当前未使用，但保留接口。
+            intent_threshold (float): 用于意图二元化的阈值。
+        返回:
+            dict: 包含预测结果的字典。
+                - "intent_labels": 预测的意图标签 (0或1), 形状 [batch_size, num_intents]。
+                - "intent_probs": 预测的意图概率, 形状 [batch_size, num_intents]。
+                - "slot_labels": 预测的槽位标签ID, 形状 [batch_size, seq_len]。
+                - "slot_probs": 预测的槽位概率, 形状 [batch_size, seq_len, num_slots]。
         """
+        self.eval() # 设置为评估模式
 
-        super(LSTMDecoder, self).__init__()
-        self.__args = args
-        self.__input_dim = input_dim
-        self.__hidden_dim = hidden_dim
-        self.__output_dim = output_dim
-        self.__dropout_rate = dropout_rate
-        self.__embedding_dim = embedding_dim
-        self.__extra_dim = extra_dim
+        hda_encoder_outputs = self.__HDA_encoder(text_token_ids)
+        h_intent_for_decoder = hda_encoder_outputs["intent_specific_hidden_states"]
+        h_slot_for_decoder = hda_encoder_outputs["slot_specific_hidden_states"]
+        final_affinity_scores_a = hda_encoder_outputs["final_affinity_scores_a"]
+        src_padding_mask_bool = hda_encoder_outputs["source_padding_mask"]
+        gcn_padding_mask = ~src_padding_mask_bool
 
-        # If embedding_dim is not None, the output and input
-        # of this structure is relevant.
-        if self.__embedding_dim is not None:
-            self.__embedding_layer = nn.Embedding(output_dim, embedding_dim)
-            self.__init_tensor = nn.Parameter(
-                torch.randn(1, self.__embedding_dim),
-                requires_grad=True
+        if self.__GCN_interaction_module and final_affinity_scores_a is not None:
+            affinity_matrix_C_for_gcn = HierarchicalDiffEncoderWithRoPE.build_hierarchical_attention_mask(
+                final_affinity_scores_a, text_token_ids.size(1), text_token_ids.device
+            ).squeeze(1)
+            h_intent_gcn_out, h_slot_gcn_out = self.__GCN_interaction_module(
+                h_intent_input=h_intent_for_decoder,
+                h_slot_input=h_slot_for_decoder,
+                affinity_matrix=affinity_matrix_C_for_gcn,
+                padding_mask=gcn_padding_mask
             )
+            h_intent_for_decoder = h_intent_gcn_out
+            h_slot_for_decoder = h_slot_gcn_out
+        elif self.__GCN_interaction_module and final_affinity_scores_a is None:
+            pass
 
-        # Network parameter definition.
-        self.__dropout_layer = nn.Dropout(self.__dropout_rate)
-
-        self.__slot_graph = GAT(
-            self.__hidden_dim,
-            self.__args.decoder_gat_hidden_dim,
-            self.__hidden_dim,
-            self.__args.gat_dropout_rate, self.__args.alpha, self.__args.n_heads,
-            self.__args.n_layers_decoder_global)
-
-        self.__global_graph = GAT(
-            self.__hidden_dim,
-            self.__args.decoder_gat_hidden_dim,
-            self.__hidden_dim,
-            self.__args.gat_dropout_rate, self.__args.alpha, self.__args.n_heads,
-            self.__args.n_layers_decoder_global)
-
-        self.__linear_layer = nn.Sequential(
-            nn.Linear(self.__hidden_dim,
-                      self.__hidden_dim),
-            nn.LeakyReLU(args.alpha),
-            nn.Linear(self.__hidden_dim, self.__output_dim),
+        # Intent Prediction
+        intent_padding_mask_for_decoder = src_padding_mask_bool.unsqueeze(-1).float()
+        _, intent_probs, _, _ = self.__intent_decoder(
+            token_encodings=h_intent_for_decoder,
+            padding_mask=intent_padding_mask_for_decoder
         )
+        predicted_intent_labels = (intent_probs > intent_threshold).long()
 
-    def forward(self, encoded_hiddens, seq_lens, global_adj=None, slot_adj=None, intent_embedding=None):
-        """ Forward process for decoder.
-
-        :param encoded_hiddens: is encoded hidden tensors produced by encoder.
-        :param seq_lens: is a list containing lengths of sentence.
-        :return: is distribution of prediction labels.
-        """
-
-        input_tensor = encoded_hiddens
-        output_tensor_list, sent_start_pos = [], 0
-
-        batch = len(seq_lens)
-        slot_graph_out = self.__slot_graph(encoded_hiddens, slot_adj)
-        intent_in = intent_embedding.unsqueeze(0).repeat(batch, 1, 1)
-        global_graph_in = torch.cat([intent_in, slot_graph_out], dim=1)
-        global_graph_out = self.__global_graph(global_graph_in, global_adj)
-        out = self.__linear_layer(global_graph_out)
-        num_intent = intent_embedding.size(0)
-        for i in range(0, len(seq_lens)):
-            output_tensor_list.append(out[i, num_intent:num_intent + seq_lens[i]])
-        return torch.cat(output_tensor_list, dim=0)
-
-
-class QKVAttention(nn.Module):
-    """
-    Attention mechanism based on Query-Key-Value architecture. And
-    especially, when query == key == value, it's self-attention.
-    """
-
-    def __init__(self, query_dim, key_dim, value_dim, hidden_dim, output_dim, dropout_rate):
-        super(QKVAttention, self).__init__()
-
-        # Record hyper-parameters.
-        self.__query_dim = query_dim
-        self.__key_dim = key_dim
-        self.__value_dim = value_dim
-        self.__hidden_dim = hidden_dim
-        self.__output_dim = output_dim
-        self.__dropout_rate = dropout_rate
-
-        # Declare network structures.
-        self.__query_layer = nn.Linear(self.__query_dim, self.__hidden_dim)
-        self.__key_layer = nn.Linear(self.__key_dim, self.__hidden_dim)
-        self.__value_layer = nn.Linear(self.__value_dim, self.__output_dim)
-        self.__dropout_layer = nn.Dropout(p=self.__dropout_rate)
-
-    def forward(self, input_query, input_key, input_value):
-        """ The forward propagation of attention.
-
-        Here we require the first dimension of input key
-        and value are equal.
-
-        :param input_query: is query tensor, (n, d_q)
-        :param input_key:  is key tensor, (m, d_k)
-        :param input_value:  is value tensor, (m, d_v)
-        :return: attention based tensor, (n, d_h)
-        """
-
-        # Linear transform to fine-tune dimension.
-        linear_query = self.__query_layer(input_query)
-        linear_key = self.__key_layer(input_key)
-        linear_value = self.__value_layer(input_value)
-
-        score_tensor = F.softmax(torch.matmul(
-            linear_query,
-            linear_key.transpose(-2, -1)
-        ), dim=-1) / math.sqrt(self.__hidden_dim)
-        forced_tensor = torch.matmul(score_tensor, linear_value)
-        forced_tensor = self.__dropout_layer(forced_tensor)
-
-        return forced_tensor
-
-
-class SelfAttention(nn.Module):
-
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout_rate):
-        super(SelfAttention, self).__init__()
-
-        # Record parameters.
-        self.__input_dim = input_dim
-        self.__hidden_dim = hidden_dim
-        self.__output_dim = output_dim
-        self.__dropout_rate = dropout_rate
-
-        # Record network parameters.
-        self.__dropout_layer = nn.Dropout(self.__dropout_rate)
-        self.__attention_layer = QKVAttention(
-            self.__input_dim, self.__input_dim, self.__input_dim,
-            self.__hidden_dim, self.__output_dim, self.__dropout_rate
+        # Slot Prediction
+        _, slot_probs = self.__slot_decoder(
+            token_encodings=h_slot_for_decoder
         )
+        predicted_slot_labels = torch.argmax(slot_probs, dim=-1) # (B, S)
 
-    def forward(self, input_x, seq_lens):
-        dropout_x = self.__dropout_layer(input_x)
-        attention_x = self.__attention_layer(
-            dropout_x, dropout_x, dropout_x
-        )
+        # 在padding位置将slot_labels设为padding_idx (例如0)
+        # src_padding_mask_bool: True for non-padding, False for padding
+        # 我们希望在padding位置的slot label是padding_idx
+        # 首先创建一个全是padding_idx的张量
+        slot_padding_token_id = getattr(self.__args, 'slot_padding_token_id', self.__HDA_encoder.padding_idx) # 通常与输入padding一致
+        padded_slot_labels = torch.full_like(predicted_slot_labels, fill_value=slot_padding_token_id)
+        # 只在非padding位置填充预测的slot labels
+        padded_slot_labels[src_padding_mask_bool] = predicted_slot_labels[src_padding_mask_bool]
 
-        return attention_x
+
+        self.train() # 恢复为训练模式 (如果后续有训练)
+        return {
+            "intent_labels": predicted_intent_labels,
+            "intent_probs": intent_probs,
+            "slot_labels": padded_slot_labels, # 返回处理过padding的slot labels
+            "slot_probs": slot_probs
+        }

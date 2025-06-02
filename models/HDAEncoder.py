@@ -140,14 +140,11 @@ class RotaryEmbedding(nn.Module):
 # --- 模块 2: 邻接亲和度计算器 (NeighborAffinityCalculator) ---
 class NeighborAffinityCalculator(nn.Module):
     """
-    根据论文公式 (3), (4), (5) 计算邻接亲和度分数 a_i,i+1。
-
-    这个模块负责计算相邻词元之间的“合并”或“连接”倾向。
+    这个模块负责计算相邻词元之间亲和度分数，也就是它们的“合并”或“连接”倾向。
     """
     def __init__(self, d_model: int, d_k_neighbor: int):
         """
         初始化邻接亲和度计算器。
-
         参数:
             d_model (int): 模型的维度。
             d_k_neighbor (int): 论文中 s_i,i+1 公式中的缩放因子 d_s。
@@ -163,13 +160,11 @@ class NeighborAffinityCalculator(nn.Module):
                 layer_idx: int = 0) -> torch.Tensor | None:
         """
         计算当前层的邻接亲和度分数。
-
         参数:
             x_input_for_affinity (torch.Tensor): 当前层用于计算亲和度的输入，形状 [batch_size, seq_len, d_model]。
             prev_affinity_scores_a (torch.Tensor | None): 上一层计算得到的 'a' 分数，形状 [batch_size, seq_len-1]。
                                                          对于第一层，此值为 None。
             layer_idx (int): 当前层的索引 (0-indexed)。
-
         返回:
             torch.Tensor | None: 更新后的邻接亲和度分数 'a'，形状 [batch_size, seq_len-1]。
                                  如果序列长度 <= 1，则返回 None。
@@ -204,9 +199,18 @@ class NeighborAffinityCalculator(nn.Module):
         else: # l>=1 (后续层) 的情况
             if prev_affinity_scores_a is None: # 理论上对于seq_len > 1且layer_idx > 0时，此项不应为None
                  raise ValueError("当 layer_idx > 0 且 seq_len > 1 时, prev_affinity_scores_a 不能为空。")
-            # a^{l}_{i,i+1} = a^{l-1}_{i,i+1} + (1 - a^{l-1}_{i,i+1}) * â^l_{i,i+1}
-            updated_affinity_scores_a = prev_affinity_scores_a + \
-                                     (1 - prev_affinity_scores_a) * current_layer_affinity_hat
+
+            # 1. 初步更新: a_new = a_old + â
+            affinity_scores_new = prev_affinity_scores_a + current_layer_affinity_hat  # [B, S-1]
+
+            # 2. 序列内条件归一化 (批处理)，构建分母：如果行最大值 > 1，则分母为行最大值；否则分母为 1.0
+            max_affinity_per_sequence, _ = torch.max(affinity_scores_new, dim=1, keepdim=True)
+            ones_tensor = torch.ones_like(max_affinity_per_sequence)  # [B, 1]
+
+            # 执行除法
+            denominators = torch.max(max_affinity_per_sequence, ones_tensor)  # [B, 1]
+            updated_affinity_scores_a = affinity_scores_new / denominators  # [B, S-1] / [B, 1] -> [B, S-1]
+
         return updated_affinity_scores_a
 
 
@@ -216,15 +220,12 @@ def build_hierarchical_attention_mask(affinity_scores_a: torch.Tensor | None,
                                       device: torch.device) -> torch.Tensor:
     """
     根据论文公式 (6) 构建层级注意力掩码 C。
-
     这个掩码 C_ij 表示从位置 i 到位置 j 的路径上的累积亲和度。
-
     参数:
         affinity_scores_a (torch.Tensor | None): 当前层计算得到的 'a' 分数，形状 [batch_size, seq_len-1]。
                                                  如果序列长度 <= 1 (即affinity_scores_a为None)，则返回允许所有注意力的掩码。
         seq_len (int): 序列长度。
         device (torch.device): 计算设备 (例如 'cpu' 或 'cuda')。
-
     返回:
         torch.Tensor: 层级注意力掩码 C，形状 [batch_size, 1, seq_len, seq_len]，
                       准备好用于多头注意力的广播。
@@ -457,12 +458,16 @@ class SwiGLUFFN(nn.Module):
 
 # --- 模块 9: 带差分注意力的层级编码器层 ---
 class HierarchicalDiffAttentionEncoderLayer(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, rotary_emb_instance: RotaryEmbedding, # 接收RoPE实例
-                 dropout_rate: float = 0.1,
-                 layer_idx: int = 0,  # 当前层索引 (0-indexed)
-                 d_k_neighbor: int | None = None, # 用于邻接亲和度计算
-                 eps_norm: float = 1e-5 # RMSNorm的eps
-                ):
+    def __init__(
+            self, d_model: int,
+            n_heads: int,
+            d_ff: int,
+            rotary_emb_instance: RotaryEmbedding, # 接收RoPE实例
+            dropout_rate: float = 0.1,
+            layer_idx: int = 0,  # 当前层索引 (0-indexed)
+            d_k_neighbor: int | None = None, # 用于邻接亲和度计算
+            eps_norm: float = 1e-5 # RMSNorm的eps
+        ):
         super().__init__()
         self.layer_idx = layer_idx # 保存层索引，用于亲和度计算
 
@@ -542,110 +547,119 @@ class HierarchicalDiffAttentionEncoderLayer(nn.Module):
         return x, current_affinity_scores_a_out, attention_weights_tuple
 
 
-# --- 模块 10 初步预测头 (PreliminaryPredictionHead) ---
-class PreliminaryPredictionHead(nn.Module):
+# --- 模块 10: 将共享隐藏状态转换为意图识别和槽位填充各自任务专用的隐藏状态 ---
+class TaskSpecificFeatureTransformer(nn.Module):
     """
-    根据论文公式 (1) 进行初步的槽位(Slot)和意图(Intent)预测。
-
-    它将每个时间步的编码器输出 h_j 与整个序列的池化表示 Pooled(h) 拼接起来，
-    然后通过线性层进行预测。
+    将共享的编码器输出转换为任务特定的隐藏状态，
+    分别用于意图识别和槽位填充。
     """
-    def __init__(self, d_model: int, num_slot_labels: int, num_intent_labels: int):
+    def __init__(
+        self,
+        d_model: int,
+        d_intent_hidden_dim: int, # 意图任务特定隐藏层的维度
+        d_slot_hidden_dim: int,   # 槽位任务特定隐藏层的维度
+        dropout_rate: float
+    ):
         """
-        初始化初步预测头。
+        初始化任务特定特征转换器。
 
         参数:
-            d_model (int): 编码器输出的维度。
-            num_slot_labels (int): 槽位标签的数量 (d_s)。如果为0，则不进行槽位预测。
-            num_intent_labels (int): 意图标签的数量 (d_i)。如果为0，则不进行意图预测。
+            d_model (int): 共享编码器输出的维度。
+            d_intent_hidden_dim (int): 意图特定隐藏状态的维度。如果为0或负数，则不为此任务生成特征。
+            d_slot_hidden_dim (int): 槽位特定隐藏状态的维度。如果为0或负数，则不为此任务生成特征。
+            dropout_rate (float): 用于转换后特征的dropout率。
         """
         super().__init__()
-        self.ds = num_slot_labels
-        self.di = num_intent_labels
+        self.d_model = d_model
+        self.d_intent_hidden_dim = d_intent_hidden_dim
+        self.d_slot_hidden_dim = d_slot_hidden_dim
 
-        # 用于预测 yS 和 yI 的线性层 - 公式 (1)
-        # 输入维度是 2 * d_model (因为是 h_j || Pooling(h) )
-        if self.di > 0: # 只有在需要意图预测时才定义意图预测线性层
-            self.Wi_linear = nn.Linear(d_model * 2, self.di)
-        if self.ds > 0: # 只有在需要槽位预测时才定义槽位预测线性层
-            self.Ws_linear = nn.Linear(d_model * 2, self.ds)
+        if self.d_intent_hidden_dim > 0:
+            self.intent_transform_linear = nn.Linear(d_model, d_intent_hidden_dim)
+            self.intent_transform_activation = nn.Tanh() # 或者 nn.GELU()
+            self.intent_transform_dropout = nn.Dropout(dropout_rate)
+        else:
+            self.intent_transform_linear = None
+
+        if self.d_slot_hidden_dim > 0:
+            self.slot_transform_linear = nn.Linear(d_model, d_slot_hidden_dim)
+            self.slot_transform_activation = nn.Tanh() # 或者 nn.GELU()
+            self.slot_transform_dropout = nn.Dropout(dropout_rate)
+        else:
+            self.slot_transform_linear = None
 
     def _masked_average_pool(self, h: torch.Tensor, src_padding_mask: torch.Tensor) -> torch.Tensor:
         """
         执行带掩码的平均池化操作，忽略padding部分。
-
-        参数:
-            h (torch.Tensor): 编码器的隐藏状态输出，形状 [batch_size, seq_len, d_model]。
-            src_padding_mask (torch.Tensor): 源序列的padding掩码，形状 [batch_size, seq_len]。
-                                             True表示非padding部分。
-
-        返回:
-            torch.Tensor: 池化后的句子表示，形状 [batch_size, d_model]。
+        (代码与之前的PreliminaryPredictionHead中的相同)
         """
-        # 将padding位置的h置为0，以便不影响求和
         masked_h = h * src_padding_mask.unsqueeze(-1).float()
-        # 沿序列长度维度求和
-        sum_h = torch.sum(masked_h, dim=1)                     # [batch_size, d_model]
-        # 计算每个序列的实际长度 (非padding部分的数量)
-        num_non_padding = src_padding_mask.sum(dim=1, keepdim=True).float() # [batch_size, 1]
-        # 防止除以零 (如果整个序列都是padding，虽然不太可能在有效输入中出现)
+        sum_h = torch.sum(masked_h, dim=1)
+        num_non_padding = src_padding_mask.sum(dim=1, keepdim=True).float()
         num_non_padding = torch.clamp(num_non_padding, min=1.0)
         return sum_h / num_non_padding
 
-    def forward(self, h: torch.Tensor, src_padding_mask: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    def forward(
+        self,
+        h_shared_encoder_output: torch.Tensor,
+        src_padding_mask: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """
         前向传播。
-
         参数:
-            h (torch.Tensor): 编码器的最终输出，形状 [batch_size, seq_len, d_model]。
+            h_shared_encoder_output (torch.Tensor): 共享编码器的输出，形状 [batch_size, seq_len, d_model]。
             src_padding_mask (torch.Tensor): 源序列的padding掩码，形状 [batch_size, seq_len]。
                                              True表示非padding部分。
-
         返回:
             tuple[torch.Tensor | None, torch.Tensor | None]:
-                - yI_prelim (torch.Tensor | None): 初步的意图预测，形状 [batch_size, seq_len, num_intent_labels] 或 None。
-                - yS_prelim (torch.Tensor | None): 初步的槽位预测，形状 [batch_size, seq_len, num_slot_labels] 或 None。
+                - h_intent_specific (torch.Tensor | None): 意图特定隐藏状态，形状 [batch_size, d_intent_hidden_dim] 或 None。
+                - h_slot_specific (torch.Tensor | None): 槽位特定隐藏状态，形状 [batch_size, seq_len, d_slot_hidden_dim] 或 None。
         """
-        yS_prelim, yI_prelim = None, None
+        h_intent_specific = None
+        h_slot_specific = None
 
-        # 如果不需要进行任何预测，则直接返回
-        if self.ds <= 0 and self.di <= 0:
-            return yI_prelim, yS_prelim
+        # --- 意图特定特征转换 ---
+        if self.intent_transform_linear is not None:
+            # 1. 池化
+            # todo 在这里进行pooling到底是好还是坏
+            # todo 其次你必须把它从这里摘出来
+            pooled_h = self._masked_average_pool(h_shared_encoder_output, src_padding_mask) # [B, D_model]
+            # 2. 线性变换、激活和Dropout
+            transformed_intent = self.intent_transform_linear(h_shared_encoder_output)
+            activated_intent = self.intent_transform_activation(transformed_intent)
+            h_intent_specific = self.intent_transform_dropout(activated_intent) # [B, d_intent_hidden_dim]
 
-        # 1. 计算句子的池化表示 Pooled(h)
-        pooled_h_sentence = self._masked_average_pool(h, src_padding_mask) # [B, D]
+        # --- 槽位特定特征转换 ---
+        if self.slot_transform_linear is not None:
+            # 1. 线性变换、激活和Dropout (逐词元)
+            transformed_slot = self.slot_transform_linear(h_shared_encoder_output) # [B, S, d_slot_hidden_dim]
+            activated_slot = self.slot_transform_activation(transformed_slot)
+            h_slot_specific = self.slot_transform_dropout(activated_slot) # [B, S, d_slot_hidden_dim]
 
-        # todo 在这里进行pooling到底是好还是坏
-        # todo 其次你必须把它从这里摘出来
-        # 2. 准备拼接特征
-        seq_len = h.size(1)
-        # 将 pooled_h_sentence 扩展到与 h 的序列长度维度一致，以便拼接
-        # pooled_h_expanded 形状: [batch_size, seq_len, d_model]
-        pooled_h_expanded = pooled_h_sentence.unsqueeze(1).expand(-1, seq_len, -1)
-
-        # 3. 拼接 h_j 和 Pooled(h)
-        # combined_features 形状: [batch_size, seq_len, d_model * 2]
-        combined_features = torch.cat((h, pooled_h_expanded), dim=-1)
-
-        # 4. 通过线性层进行预测
-        if self.ds > 0:
-            yS_prelim = self.Ws_linear(combined_features)  # [B, S, ds]
-        if self.di > 0:
-            yI_prelim = self.Wi_linear(combined_features)  # [B, S, di]
-
-        return yI_prelim, yS_prelim
+        return h_intent_specific, h_slot_specific
 
 
 # --- 主模型: 层级差分注意力编码器 ---
 class HierarchicalDiffEncoderWithRoPE(nn.Module):
     """主编码器模型，集成了层级差分注意力机制，并使用RoPE进行位置编码。"""
-    def __init__(self, num_encoder_layers: int, d_model: int, n_heads: int, d_ff: int,
-                 input_vocab_size: int, max_seq_len: int, # max_seq_len 用于RoPE
-                 num_slot_labels: int, num_intent_labels: int,
-                 dropout_rate: float = 0.1, padding_idx: int = 0,
-                 d_k_neighbor: int | None = None,
-                 rope_theta: float = 10000.0 # RoPE的theta参数
-                ):
+    def __init__(
+            self,
+            num_encoder_layers: int,
+            d_model: int,
+            n_heads: int,
+            d_ff: int,
+            input_vocab_size: int,
+            max_seq_len: int, # max_seq_len 用于RoPE
+
+            d_intent_hidden_dim: int,
+            d_slot_hidden_dim: int,
+
+            rope_theta: float,
+            dropout_rate: float,
+            padding_idx: int = 0,
+
+            d_k_neighbor: int | None = None,
+    ):
         super().__init__()
         self.padding_idx = padding_idx
         self.d_model = d_model
@@ -669,9 +683,14 @@ class HierarchicalDiffEncoderWithRoPE(nn.Module):
             ) for i in range(num_encoder_layers)
         ])
 
-        self.prelim_predictor = None
-        if num_slot_labels > 0 or num_intent_labels > 0:
-            self.prelim_predictor = PreliminaryPredictionHead(d_model, num_slot_labels, num_intent_labels)
+        self.task_feature_transformer = None
+        if d_intent_hidden_dim > 0 or d_slot_hidden_dim > 0:
+            self.task_feature_transformer = TaskSpecificFeatureTransformer(
+                d_model=d_model,
+                d_intent_hidden_dim=d_intent_hidden_dim,
+                d_slot_hidden_dim=d_slot_hidden_dim,
+                dropout_rate=dropout_rate  # 可以使用与编码器相同的dropout或单独配置
+            )
 
     def forward(self, src_tokens: torch.Tensor) -> dict:
         src_padding_mask = (src_tokens != self.padding_idx)
@@ -690,16 +709,20 @@ class HierarchicalDiffEncoderWithRoPE(nn.Module):
             all_layer_attention_weight_tuples.append(attention_weights_tuple)
 
         h = x
-        yI_prelim, yS_prelim = None, None
-        if self.prelim_predictor is not None:
-            yI_prelim, yS_prelim = self.prelim_predictor(h, src_padding_mask)
+
+        h_intent_specific, h_slot_specific = None, None
+        if self.task_feature_transformer is not None:
+            h_intent_specific, h_slot_specific = self.task_feature_transformer(
+                h_shared_encoder_output=x,  # x 是编码器的最终输出
+                src_padding_mask=src_padding_mask
+            )
 
         final_affinity_to_return = current_affinity_scores_a_inter_layer if self.d_k_neighbor is not None else None
 
         return {
             "encoder_output": h,
-            "prelim_intent_predictions": yI_prelim,
-            "prelim_slot_predictions": yS_prelim,
+            "intent_specific_hidden_states": h_intent_specific,
+            "slot_specific_hidden_states": h_slot_specific,
             "final_affinity_scores_a": final_affinity_to_return,
             "all_layer_attention_weights": all_layer_attention_weight_tuples,
             "source_padding_mask": src_padding_mask
@@ -709,48 +732,57 @@ class HierarchicalDiffEncoderWithRoPE(nn.Module):
 if __name__ == '__main__':
     vocab_size = 1000
     d_model = 128
-    n_heads = 4
+    n_heads = 2
     # 对于SwiGLU, d_ff 通常是 d_model * (8/3) 或 d_model * 4。
     # 但为了保持与之前示例的参数量相似性（如果PositionalEncoding很大），我们可能需要调整。
     # 论文中Diff Transformer FFN size 是 8/3 * d_model * 2 (因为SwiGLU有两个线性层到d_ff)
     # 这里简化 d_ff = d_model * 2 (指SwiGLU的中间维度)
     d_ff = d_model * 2 # SwiGLU 通常用 d_ff = d_model * 8/3 * 2，这里简化
-    num_enc_layers = 2
+    num_enc_layers = 3
     max_seq_len_for_rope = 60 # 用于RoPE
     dropout = 0.1
     pad_idx = 0
-    num_slots = 5
-    num_intents = 2
     dk_neighbor_val = int(math.sqrt(d_model))
 
+    d_intent_hid_dim = 64 # 示例：意图特定隐藏层维度
+    d_slot_hid_dim = d_model # 示例：槽位特定隐藏层维度可以与d_model相同或不同
+
     print("--- 测试带RoPE和层级特性的层级差分注意力编码器 ---")
-    hier_diff_encoder_with_rope = HierarchicalDiffEncoderWithRoPE(
+    encoder = HierarchicalDiffEncoderWithRoPE(
         num_encoder_layers=num_enc_layers,
         d_model=d_model,
         n_heads=n_heads,
         d_ff=d_ff,
         input_vocab_size=vocab_size,
         max_seq_len=max_seq_len_for_rope, # 传递给RoPE
-        num_slot_labels=num_slots,
-        num_intent_labels=num_intents,
+        d_intent_hidden_dim=d_intent_hid_dim,
+        d_slot_hidden_dim=d_slot_hid_dim,
+
+        rope_theta=1000.0,
         dropout_rate=dropout,
         padding_idx=pad_idx,
-        d_k_neighbor=dk_neighbor_val
+        d_k_neighbor=dk_neighbor_val,
     )
 
-    batch = 2; seq_len_val = 10 # 实际序列长度可以小于max_seq_len_for_rope
+    batch = 2
+    seq_len_val = 10 # 实际序列长度可以小于max_seq_len_for_rope
+
     dummy_tokens = torch.randint(1, vocab_size, (batch, seq_len_val))
     dummy_tokens[0, -3:] = pad_idx
 
-    hier_diff_encoder_with_rope.eval()
+
+    print("\n--- 完整编码器前向传播测试 ---")
+    encoder.eval()
     with torch.no_grad():
-        outputs_rope = hier_diff_encoder_with_rope(dummy_tokens)
+        outputs_rope = encoder(dummy_tokens)
 
     print(f"带RoPE的编码器输出形状: {outputs_rope['encoder_output'].shape}")
-    if outputs_rope["prelim_slot_predictions"] is not None:
-        print(f"槽位预测形状: {outputs_rope['prelim_slot_predictions'].shape}")
+    if outputs_rope["intent_specific_hidden_states"] is not None:
+        print(f"意图特殊隐藏值形状: {outputs_rope['intent_specific_hidden_states'].shape}")
+
     if outputs_rope["final_affinity_scores_a"] is not None:
         print(f"最终亲和度分数形状: {outputs_rope['final_affinity_scores_a'].shape}")
+        print(f"最终亲和度分数: {outputs_rope['final_affinity_scores_a']}")
 
     print(f"注意力权重元组列表长度: {len(outputs_rope['all_layer_attention_weights'])}")
     if outputs_rope['all_layer_attention_weights']:

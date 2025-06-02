@@ -245,7 +245,6 @@ class DatasetManager(object):
         print('\tlearning rate:							    {};'.format(self.learning_rate))
         print('\trandom seed:							    {};'.format(self.__args.random_state))
         print('\trate of l2 penalty:					    {};'.format(self.l2_penalty))
-        print('\trate of dropout in network:                {};'.format(self.__args.dropout_rate))
 
         print("\nEnd of parameters show. Save dir: {}.\n\n".format(self.save_dir))
 

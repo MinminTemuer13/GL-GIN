@@ -70,7 +70,7 @@ class Processor(object):
             time_con = time.time() - time_start
             print("The model has been loaded into GPU and cost {:.6f} seconds.\n".format(time_con))
 
-        self.__criterion = nn.NLLLoss()
+        self.__criterion_slot = nn.BCEWithLogitsLoss()
         self.__criterion_intent = nn.BCEWithLogitsLoss()
 
         self.__optimizer = optim.AdamW(
@@ -103,32 +103,39 @@ class Processor(object):
             for text_batch, slot_batch, intent_batch in tqdm(dataloader, ncols=50):
                 padded_text, [sorted_slot, sorted_intent], seq_lens = self.__dataset.add_padding(
                     text_batch, [(slot_batch, True), (intent_batch, False)])
-                sorted_intent_exp = []
-                for item, num in zip(sorted_intent, seq_lens):
-                    sorted_intent_exp.extend([item] * num)
-                sorted_intent = [multilabel2one_hot(intents, len(self.__dataset.intent_alphabet)) for intents in
-                                 sorted_intent_exp]
+
+                processed_intent_labels = []
+                for i in range(len(sorted_intent)):
+                    processed_intent_labels.append(sorted_intent[i][0])
+                #  todo 这一步有问题！！！ 最后几个不是list，不知道为什么
+
+                print(processed_intent_labels)
+                print(sorted_slot)
+
+                intent_var = torch.Tensor(processed_intent_labels)
                 text_var = torch.LongTensor(padded_text)
                 slot_var = torch.LongTensor(sorted_slot)
-                intent_var = torch.Tensor(sorted_intent)
-                max_len = np.max(seq_lens)
+
+                slot_target_one_hot = F.one_hot(slot_var, num_classes=len(self.__dataset.slot_alphabet)).float()
 
                 if self.args.gpu:
                     text_var = text_var.cuda()
-                    slot_var = slot_var.cuda()
+                    slot_target_one_hot = slot_target_one_hot.cuda()
                     intent_var = intent_var.cuda()
 
-                random_slot, random_intent = random.random(), random.random()
+                intent_logits, slot_logits = self.__model(text_var)
 
-                slot_out, intent_out = self.__model(text_var, seq_lens)
+                slot_loss = self.__criterion_slot(slot_logits, slot_target_one_hot)
+                print(f"slot_loss: {slot_loss}")
 
-                slot_var = torch.cat([slot_var[i][:seq_lens[i]] for i in range(0, len(seq_lens))], dim=0)
-                slot_loss = self.__criterion(slot_out, slot_var)
+                intent_loss = self.__criterion_intent(intent_logits, intent_var)
+                print(f"intent_loss: {intent_loss}")
 
-                intent_out = torch.cat([intent_out[i][:seq_lens[i]] for i in range(0, len(seq_lens))], dim=0)
-                intent_loss = self.__criterion_intent(intent_out, intent_var)
-                intent_loss_alpha = self.args.intent_loss_alpha
-                slot_loss_alpha = self.args.slot_loss_alpha
+                intent_loss_alpha = 1
+                # self.args.intent_loss_alpha
+                slot_loss_alpha = 1
+                # self.args.slot_loss_alpha
+
                 batch_loss = slot_loss_alpha * slot_loss + intent_loss_alpha * intent_loss
                 self.__optimizer.zero_grad()
                 batch_loss.backward()
