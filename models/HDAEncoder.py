@@ -3,37 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-# --- 模块 0: RMSNorm 实现 ---
-class RMSNorm(nn.Module):
-    """
-    均方根层归一化 (Root Mean Square Layer Normalization)。
-    论文中提到使用 RMSNorm。
-    """
-    def __init__(self, dim: int, eps: float = 1e-6):
-        """
-        初始化 RMSNorm。
-
-        参数:
-            dim (int): 输入特征的维度。
-            eps (float): 为防止除以零而加入的小值。
-        """
-        super().__init__()
-        self.eps = eps
-        #可学习的缩放参数 gamma
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def _norm(self, x: torch.Tensor) -> torch.Tensor:
-        """计算 RMSNorm """
-        # x * 1/sqrt(mean(x^2) + eps)
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        前向传播。
-        输入的形状是 (..., dim)
-        """
-        output = self._norm(x.float()).type_as(x) # 转换为float计算，然后转回原类型
-        return output * self.weight
+from models.components import RMSNorm, SwiGLUFFN
 
 
 # --- 模块 1: 旋转位置编码 (RotaryEmbedding) ---
@@ -437,26 +407,7 @@ class HierarchicalDifferentialAttention(nn.Module):
         return output, (attn_w1, attn_w2)
 
 
-# --- 模块 8: SwiGLU 前馈网络 ---
-class SwiGLUFFN(nn.Module):
-    """
-    SwiGLU 前馈网络。 FFN(x) = (Swish(x W_g) * (x W_1)) W_2
-    """
-    def __init__(self, d_model: int, d_ff: int, dropout_rate_ffn: float = 0.1):
-        super().__init__()
-        self.w_g = nn.Linear(d_model, d_ff, bias=False) # 通常SwiGLU的门和主路径不加偏置
-        self.w_1 = nn.Linear(d_model, d_ff, bias=False)
-        self.w_2 = nn.Linear(d_ff, d_model, bias=False)
-        self.dropout_ffn_internal = nn.Dropout(dropout_rate_ffn) # Dropout在最终输出前
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_val = F.silu(self.w_g(x))    # Swish(x W_g)
-        hidden_val = self.w_1(x)          # x W_1
-        # Dropout 在 w_2 之前
-        return self.w_2(self.dropout_ffn_internal(gate_val * hidden_val))
-
-
-# --- 模块 9: 带差分注意力的层级编码器层 ---
+# --- 模块 8: 带差分注意力的层级编码器层 ---
 class HierarchicalDiffAttentionEncoderLayer(nn.Module):
     def __init__(
             self, d_model: int,
@@ -547,7 +498,7 @@ class HierarchicalDiffAttentionEncoderLayer(nn.Module):
         return x, current_affinity_scores_a_out, attention_weights_tuple
 
 
-# --- 模块 10: 将共享隐藏状态转换为意图识别和槽位填充各自任务专用的隐藏状态 ---
+# --- 模块 9: 将共享隐藏状态转换为意图识别和槽位填充各自任务专用的隐藏状态 ---
 class TaskSpecificFeatureTransformer(nn.Module):
     """
     将共享的编码器输出转换为任务特定的隐藏状态，
@@ -574,19 +525,20 @@ class TaskSpecificFeatureTransformer(nn.Module):
         self.d_intent_hidden_dim = d_intent_hidden_dim
         self.d_slot_hidden_dim = d_slot_hidden_dim
 
-        if self.d_intent_hidden_dim > 0:
-            self.intent_transform_linear = nn.Linear(d_model, d_intent_hidden_dim)
-            self.intent_transform_activation = nn.Tanh() # 或者 nn.GELU()
-            self.intent_transform_dropout = nn.Dropout(dropout_rate)
-        else:
-            self.intent_transform_linear = None
+        self.intent_transform_sequential = nn.Sequential(
+            nn.Linear(d_model, d_intent_hidden_dim),
+            nn.LayerNorm(d_intent_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+        )
 
-        if self.d_slot_hidden_dim > 0:
-            self.slot_transform_linear = nn.Linear(d_model, d_slot_hidden_dim)
-            self.slot_transform_activation = nn.Tanh() # 或者 nn.GELU()
-            self.slot_transform_dropout = nn.Dropout(dropout_rate)
-        else:
-            self.slot_transform_linear = None
+        self.slot_transform_sequential = nn.Sequential(
+            nn.Linear(d_model, d_slot_hidden_dim),
+            nn.LayerNorm(d_slot_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+        )
+
 
     def _masked_average_pool(self, h: torch.Tensor, src_padding_mask: torch.Tensor) -> torch.Tensor:
         """
@@ -619,22 +571,12 @@ class TaskSpecificFeatureTransformer(nn.Module):
         h_slot_specific = None
 
         # --- 意图特定特征转换 ---
-        if self.intent_transform_linear is not None:
-            # 1. 池化
-            # todo 在这里进行pooling到底是好还是坏
-            # todo 其次你必须把它从这里摘出来
-            pooled_h = self._masked_average_pool(h_shared_encoder_output, src_padding_mask) # [B, D_model]
-            # 2. 线性变换、激活和Dropout
-            transformed_intent = self.intent_transform_linear(h_shared_encoder_output)
-            activated_intent = self.intent_transform_activation(transformed_intent)
-            h_intent_specific = self.intent_transform_dropout(activated_intent) # [B, d_intent_hidden_dim]
-
-        # --- 槽位特定特征转换 ---
-        if self.slot_transform_linear is not None:
-            # 1. 线性变换、激活和Dropout (逐词元)
-            transformed_slot = self.slot_transform_linear(h_shared_encoder_output) # [B, S, d_slot_hidden_dim]
-            activated_slot = self.slot_transform_activation(transformed_slot)
-            h_slot_specific = self.slot_transform_dropout(activated_slot) # [B, S, d_slot_hidden_dim]
+        # 1. 池化
+        # todo 在这里进行pooling到底是好还是坏
+        pooled_h = self._masked_average_pool(h_shared_encoder_output, src_padding_mask)  # [B, D_model]
+        # 2. 线性变换
+        h_intent_specific = self.intent_transform_sequential(h_shared_encoder_output)
+        h_slot_specific = self.slot_transform_sequential(h_shared_encoder_output)
 
         return h_intent_specific, h_slot_specific
 
@@ -656,6 +598,7 @@ class HierarchicalDiffEncoderWithRoPE(nn.Module):
 
             rope_theta: float,
             dropout_rate: float,
+            eps_norm: float,
             padding_idx: int = 0,
 
             d_k_neighbor: int | None = None,
@@ -677,9 +620,14 @@ class HierarchicalDiffEncoderWithRoPE(nn.Module):
 
         self.layers = nn.ModuleList([
             HierarchicalDiffAttentionEncoderLayer(
-                d_model=d_model, n_heads=n_heads, d_ff=d_ff,
+                d_model=d_model,
+                n_heads=n_heads,
+                d_ff=d_ff,
                 rotary_emb_instance=self.rope_emb, # 将RoPE实例传递给每一层
-                dropout_rate=dropout_rate, layer_idx=i, d_k_neighbor=d_k_neighbor
+                dropout_rate=dropout_rate,
+                layer_idx=i,
+                d_k_neighbor=d_k_neighbor,
+                eps_norm=eps_norm
             ) for i in range(num_encoder_layers)
         ])
 

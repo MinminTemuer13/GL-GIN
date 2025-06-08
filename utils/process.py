@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from mpmath import sigmoid
 from sklearn.metrics import f1_score
 from torch.autograd import Variable
 import torch.nn.functional as F
@@ -70,14 +71,37 @@ class Processor(object):
             time_con = time.time() - time_start
             print("The model has been loaded into GPU and cost {:.6f} seconds.\n".format(time_con))
 
-        self.__criterion_slot = nn.BCEWithLogitsLoss()
-        self.__criterion_intent = nn.BCEWithLogitsLoss()
+        # CRF损失函数
+        # self.__criterion_slot = nn.BCEWithLogitsLoss()
+        self.__criterion_intent = nn.BCEWithLogitsLoss(reduction='sum')
 
         self.__optimizer = optim.AdamW(
             self.__model.parameters(),
             lr=self.__dataset.learning_rate,  # 假设超参数在 self.__args
             weight_decay=self.__dataset.l2_penalty  # 假设超参数在 self.__args
         )
+
+        # try:
+        #     encoder_params = self.__model.encoder.parameters()
+        #     slot_decoder_params = self.__model.slot_decoder.parameters()
+        #     intent_decoder_params = self.__model.intent_decoder.parameters()
+        # except AttributeError as e:
+        #     print("Error: Could not find model sub-modules (.encoder, .slot_decoder, .intent_decoder).")
+        #     print("Please make sure your main model class exposes these modules.")
+        #     raise e
+        #
+        #     # 3. 创建参数组列表
+        # param_groups = [
+        #     {'params': encoder_params, 'lr': base_lr},
+        #     {'params': slot_decoder_params, 'lr': slot_decoder_lr},
+        #     {'params': intent_decoder_params, 'lr': intent_decoder_lr}
+        # ]
+        #
+        # # 4. 初始化优化器
+        # self.__optimizer = optim.AdamW(
+        #     param_groups,
+        #     weight_decay=self.__dataset.l2_penalty
+        # )
 
         if self.__load_dir:
             if self.args.gpu:
@@ -100,43 +124,54 @@ class Processor(object):
             time_start = time.time()
             self.__model.train()
 
-            for text_batch, slot_batch, intent_batch in tqdm(dataloader, ncols=50):
+            for text_batch, slot_batch, intent_batch in tqdm(dataloader, ncols=80):
                 padded_text, [sorted_slot, sorted_intent], seq_lens = self.__dataset.add_padding(
                     text_batch, [(slot_batch, True), (intent_batch, False)])
 
-                processed_intent_labels = []
-                for i in range(len(sorted_intent)):
-                    processed_intent_labels.append(sorted_intent[i][0])
-                #  todo 这一步有问题！！！ 最后几个不是list，不知道为什么
+                sorted_intent_multi_hot = []
+                for intents in sorted_intent:
+                    res = [0.] * len(self.__dataset.intent_alphabet)
+                    if len(intents) == 0:
+                        continue
+                    if isinstance(intents[0], list):
+                        for label in intents[0]:
+                            res[label] = 1.
+                    else:
+                        for label in intents:
+                            res[label] = 1.
+                    sorted_intent_multi_hot.append(res)
 
-                print(processed_intent_labels)
-                print(sorted_slot)
-
-                intent_var = torch.Tensor(processed_intent_labels)
                 text_var = torch.LongTensor(padded_text)
+                intent_var = torch.Tensor(sorted_intent_multi_hot)
                 slot_var = torch.LongTensor(sorted_slot)
 
                 slot_target_one_hot = F.one_hot(slot_var, num_classes=len(self.__dataset.slot_alphabet)).float()
 
                 if self.args.gpu:
                     text_var = text_var.cuda()
+                    slot_var = slot_var.cuda()
                     slot_target_one_hot = slot_target_one_hot.cuda()
                     intent_var = intent_var.cuda()
 
-                intent_logits, slot_logits = self.__model(text_var)
+                # todo 第一个
+                intent_logits, _, slot_loss, _ = self.__model(text_var, intent_var.float(), slot_var.float())
 
-                slot_loss = self.__criterion_slot(slot_logits, slot_target_one_hot)
-                print(f"slot_loss: {slot_loss}")
+                # todo 这里要看 损失值是不是真的正常
+                # print(F.sigmoid(intent_logits)[:5])
+                # print(intent_var[:5])
+                intent_loss = self.__criterion_intent(intent_logits, intent_var.float())
+                # print(intent_loss)
 
-                intent_loss = self.__criterion_intent(intent_logits, intent_var)
-                print(f"intent_loss: {intent_loss}")
+                # print(slot_logits)
+                # print(slot_target_one_hot)
+                # slot_loss = self.__criterion_slot(slot_logits, slot_target_one_hot)
+                # print(slot_loss)
 
-                intent_loss_alpha = 1
-                # self.args.intent_loss_alpha
-                slot_loss_alpha = 1
-                # self.args.slot_loss_alpha
+                intent_loss_alpha = self.args.intent_loss_alpha
+                slot_loss_alpha = self.args.slot_loss_alpha
 
-                batch_loss = slot_loss_alpha * slot_loss + intent_loss_alpha * intent_loss
+                batch_loss = intent_loss_alpha * intent_loss + slot_loss_alpha * slot_loss
+
                 self.__optimizer.zero_grad()
                 batch_loss.backward()
                 self.__optimizer.step()
@@ -173,42 +208,45 @@ class Processor(object):
 
 
             change, time_start = False, time.time()
-            dev_slot_f1_score, dev_intent_f1_score, dev_intent_acc_score, dev_sent_acc_score = self.estimate(
+            dev_slot_f1_score, dev_intent_f1_score, dev_slot_acc_score, dev_intent_acc_score, dev_sent_acc_score = self.estimate(
                 if_dev=True,
                 test_batch=self.__batch_size,
-                args=self.args)
-            fitlog.add_metric(
-                {"dev": {"slot f1": dev_slot_f1_score,
-                         "intent f1": dev_intent_f1_score,
-                         "intent acc": dev_intent_acc_score,
-                         "exact acc": dev_sent_acc_score
-                         }
-                 },
-                step=epoch
+                args=self.args
             )
+            fitlog.add_metric({
+                "dev": {
+                    "slot f1": dev_slot_f1_score,
+                    "intent f1": dev_intent_f1_score,
+                    "slot acc": dev_slot_acc_score,
+                    "intent acc": dev_intent_acc_score,
+                    "exact acc": dev_sent_acc_score
+                }
+            },step=epoch)
 
 
-            test_slot_f1, test_intent_f1, test_intent_acc, test_sent_acc = self.estimate(
-                if_dev=False, test_batch=self.__batch_size, args=self.args)
+            test_slot_f1, test_intent_f1, test_slot_acc, test_intent_acc, test_sent_acc = self.estimate(
+                if_dev=False, test_batch=self.__batch_size, args=self.args
+            )
             fitlog.add_metric({
                 "test": {
                     "slot f1": test_slot_f1,
                     "intent f1": test_intent_f1,
+                    "slot acc": test_slot_acc,
                     "intent acc": test_intent_acc,
                     "exact acc": test_sent_acc
                 }
             }, step=epoch)
 
 
-            if test_sent_acc >= best_dev_sent or dev_slot_f1_score >= best_dev_slot:
-                #  or dev_intent_acc_score >= best_dev_intent
+            if test_sent_acc >= best_dev_sent or dev_intent_acc_score >= best_dev_intent:
+                # or dev_slot_f1_score >= best_dev_slot
                 no_improve = 0
                 best_epoch = epoch
                 best_dev_sent = dev_sent_acc_score
 
-                print('Test result: epoch: {}, slot f1 score: {:.6f}, intent f1 score: {:.6f}, intent acc score:'
-                      ' {:.6f}, semantic accuracy score: {:.6f}.'.
-                      format(epoch, test_slot_f1, test_intent_f1, test_intent_acc, test_sent_acc))
+                print('[Epoch {:2d}]: In test process, the slot f1 score is {:2.6f}, the intent f1 score is {:.6f}, '
+                      'the slot acc score is {:.6f}, the intent acc score is {:.6f}, the semantic acc is {:.6f}.'.
+                      format(epoch, test_slot_f1, test_intent_f1, test_slot_acc, test_intent_acc, test_sent_acc))
 
                 model_save_dir = os.path.join(self.__dataset.save_dir, "model")
                 if not os.path.exists(model_save_dir):
@@ -237,11 +275,9 @@ class Processor(object):
                 torch.save(self.__dataset, os.path.join(model_save_dir, 'dataset.pkl'))
 
                 time_con = time.time() - time_start
-                print('[Epoch {:2d}]: In validation process, the slot f1 score is {:2.6f}, ' \
-                      'the intent f1 score is {:2.6f}, the intent acc score is {:2.6f}, the semantic acc is {:.2f}, cost about {:2.6f} seconds.\n'.format(
-                    epoch, dev_slot_f1_score, dev_intent_f1_score, dev_intent_acc_score,
-                    dev_sent_acc_score, time_con))
-
+                print('[Epoch {:2d}]: In vali process, the slot f1 score is {:2.6f}, ' \
+                      'the intent f1 score is {:2.6f}, the slot acc score is {:2.6f}, the intent acc score is {:2.6f}, the semantic acc is {:2.6f}, cost about {:2.6f} seconds.\n'.format(
+                    epoch, dev_slot_f1_score, dev_intent_f1_score, dev_slot_acc_score, dev_intent_acc_score, dev_sent_acc_score, time_con))
             else:
                 no_improve += 1
                 # self.__lr_scheduler.step()
@@ -260,21 +296,28 @@ class Processor(object):
 
         if if_dev:
             ss, pred_slot, real_slot, pred_intent, real_intent = self.prediction(
-                self.__model, self.__dataset, "dev", test_batch, args)
+                self.__model, self.__dataset, "dev", test_batch, args
+            )
         else:
             ss, pred_slot, real_slot, pred_intent, real_intent = self.prediction(
-                self.__model, self.__dataset, "test", test_batch, args)
+                self.__model, self.__dataset, "test", test_batch, args
+            )
 
         num_intent = len(self.__dataset.intent_alphabet)
+
         slot_f1_score = miulab.computeF1Score(ss, real_slot, pred_slot, args)[0]
         intent_f1_score = f1_score(
             instance2onehot(self.__dataset.intent_alphabet.get_index, num_intent, real_intent),
             instance2onehot(self.__dataset.intent_alphabet.get_index, num_intent, pred_intent),
             average='macro', zero_division=True)
+
+        slot_acc_score = Evaluator.slot_acc(pred_slot, real_slot)
         intent_acc_score = Evaluator.intent_acc(pred_intent, real_intent)
         sent_acc = Evaluator.semantic_acc(pred_slot, real_slot, pred_intent, real_intent)
-        print("slot f1: {}, intent f1: {}, intent acc: {}, exact acc: {}".format(slot_f1_score, intent_f1_score,
-                                                                                 intent_acc_score, sent_acc))
+
+        print("slot f1: {}, intent f1: {}, slot acc: {}, intent acc: {}, exact acc: {}".format(
+            slot_f1_score, intent_f1_score, slot_acc_score, intent_acc_score, sent_acc))
+
         if not if_dev:
             print("")
 
@@ -287,7 +330,7 @@ class Processor(object):
                     fw.write(w + '\t' + r_slot + '\t''\n')
                 fw.write('\n\n')
 
-        return slot_f1_score, intent_f1_score, intent_acc_score, sent_acc
+        return slot_f1_score, intent_f1_score, slot_acc_score, intent_acc_score, sent_acc
 
     @staticmethod
     def validate(model_path, dataset, batch_size, num_intent, args):
@@ -301,7 +344,8 @@ class Processor(object):
             model = torch.load(model_path, map_location=torch.device('cpu'))
 
         ss, pred_slot, real_slot, pred_intent, real_intent = Processor.prediction(
-            model, dataset, "test", batch_size, args)
+            model, dataset, "test", batch_size, args
+        )
 
         # To make sure the directory for save error prediction.
         mistake_dir = os.path.join(dataset.save_dir, "error")
@@ -312,10 +356,13 @@ class Processor(object):
         intent_f1_score = f1_score(instance2onehot(dataset.intent_alphabet.get_index, num_intent, real_intent),
                                    instance2onehot(dataset.intent_alphabet.get_index, num_intent, pred_intent),
                                    average='macro', zero_division=True)
+
+        slot_acc_score = Evaluator.slot_acc(pred_slot, real_slot)
         intent_acc_score = Evaluator.intent_acc(pred_intent, real_intent)
         sent_acc = Evaluator.semantic_acc(pred_slot, real_slot, pred_intent, real_intent)
-        print("slot f1: {}, intent f1: {}, intent acc: {}, exact acc: {}".format(slot_f1_score, intent_f1_score,
-                                                                                 intent_acc_score, sent_acc))
+
+        print("slot f1: {}, intent f1: {}, slot acc: {}, intent acc: {}, exact acc: {}".format(
+            slot_f1_score, intent_f1_score, slot_acc_score, intent_acc_score, sent_acc))
         # Write those sample both have intent and slot errors.
 
         with open(os.path.join(args.save_dir, 'error.txt'), 'w', encoding="utf8") as fw:
@@ -342,7 +389,7 @@ class Processor(object):
         pred_slot, real_slot = [], []
         pred_intent, real_intent = [], []
         all_token = []
-        for text_batch, slot_batch, intent_batch in tqdm(dataloader, ncols=50):
+        for text_batch, slot_batch, intent_batch in tqdm(dataloader, ncols=80):
             padded_text, [sorted_slot, sorted_intent], seq_lens = dataset.add_padding(
                 text_batch, [(slot_batch, False), (intent_batch, False)],
                 digital=False
@@ -357,17 +404,27 @@ class Processor(object):
 
             digit_text = dataset.word_alphabet.get_index(padded_text)
             var_text = torch.LongTensor(digit_text)
-            max_len = np.max(seq_lens)
             if args.gpu:
                 var_text = var_text.cuda()
-            slot_idx, intent_idx = model(var_text, seq_lens, n_predicts=1)
-            nested_slot = Evaluator.nested_list([list(Evaluator.expand_list(slot_idx))], seq_lens)[0]
-            pred_slot.extend(dataset.slot_alphabet.get_instance(nested_slot))
-            intent_idx_ = [[] for i in range(len(digit_text))]
-            for item in intent_idx:
-                intent_idx_[item[0]].append(item[1])
-            intent_idx = intent_idx_
-            pred_intent.extend(dataset.intent_alphabet.get_instance(intent_idx))
+
+            # todo 第二个
+            _, intent_probs, _, slot_predictions = model(var_text)
+
+
+            predicted_intent_labels_bool = (intent_probs > args.intent_threshold)
+            predicted_slot_labels = slot_predictions # (B, S)
+
+            actual_current_batch_size = predicted_intent_labels_bool.size(0)
+            for i in range(actual_current_batch_size):
+                current_seq_len = seq_lens[i]  # 获取当前序列的实际长度
+                # 处理意图
+                true_intent_indices = predicted_intent_labels_bool[i].nonzero(as_tuple=True)[0].tolist()
+                pred_intent.append(dataset.intent_alphabet.get_instance(true_intent_indices))
+                # 处理槽位
+                current_predicted_slot_indices = predicted_slot_labels[i]  # 形状是 (max_seq_len,)
+                pred_slot.append(dataset.slot_alphabet.get_instance(current_predicted_slot_indices[:current_seq_len]))
+
+
         if 'MixSNIPS' in args.data_dir or 'MixATIS' in args.data_dir or 'DSTC' in args.data_dir:
             [p_intent.sort() for p_intent in pred_intent]
         with open(os.path.join(args.save_dir, 'token.txt'), "w", encoding="utf8") as writer:
@@ -379,10 +436,23 @@ class Processor(object):
                 idx = idx + len(line)
                 writer.writelines("\n")
 
+        model.train()
+
         return all_token, pred_slot, real_slot, pred_intent, real_intent
 
 
 class Evaluator(object):
+
+    @staticmethod
+    def slot_acc(pred_slot, real_slot):
+        total_count, correct_count = 0.0, 0.0
+        for p_slot, r_slot in zip(pred_slot, real_slot):
+
+            if p_slot == r_slot:
+                correct_count += 1.0
+            total_count += 1.0
+
+        return 1.0 * correct_count / total_count
 
     @staticmethod
     def intent_acc(pred_intent, real_intent):
@@ -403,9 +473,13 @@ class Evaluator(object):
         """
         total_count, correct_count = 0.0, 0.0
         for p_slot, r_slot, p_intent, r_intent in zip(pred_slot, real_slot, pred_intent, real_intent):
-
             if p_slot == r_slot and p_intent == r_intent:
                 correct_count += 1.0
+            # else:
+            #     print(p_slot)
+            #     print(r_slot)
+            #     print(p_intent)
+            #     print(r_intent)
             total_count += 1.0
 
         return 1.0 * correct_count / total_count
